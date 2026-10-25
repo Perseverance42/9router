@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getSettings, updateSettings } from "@/lib/localDb";
+import { getSettings, updateSettings, getCombos } from "@/lib/localDb";
 import { applyOutboundProxyEnv } from "@/lib/network/outboundProxy";
 import { resetComboRotation } from "open-sse/services/combo.js";
 import bcrypt from "bcryptjs";
@@ -41,6 +41,30 @@ export async function PATCH(request) {
 
     // Strip protected secrets before any internal handling sets them
     for (const key of PROTECTED_SETTING_KEYS) delete body[key];
+
+    // Legacy timeout tuning and non-Fusion strategies remain untouched.
+    const fusionBounds = Object.entries(body.comboStrategies || {}).filter(([, strategy]) =>
+      strategy?.fallbackStrategy === "fusion" && strategy.fusionTuning &&
+      (Object.prototype.hasOwnProperty.call(strategy.fusionTuning, "minPanels") ||
+        Object.prototype.hasOwnProperty.call(strategy.fusionTuning, "maxPanels"))
+    );
+    if (fusionBounds.length > 0) {
+      const combos = await getCombos();
+      for (const [name, strategy] of fusionBounds) {
+        const combo = combos.find((entry) => entry.name === name);
+        if (!combo) {
+          return NextResponse.json({ error: `Unknown Fusion combo: ${name}` }, { status: 400 });
+        }
+        const count = combo.models.length;
+        const { minPanels = count, maxPanels = count } = strategy.fusionTuning;
+        if (!Number.isInteger(minPanels) || !Number.isInteger(maxPanels) ||
+          minPanels < 0 || minPanels > maxPanels || maxPanels > count) {
+          return NextResponse.json({
+            error: `Fusion combo "${name}" requires integer bounds 0 <= minPanels <= maxPanels <= ${count}`,
+          }, { status: 400 });
+        }
+      }
+    }
 
     // If updating password, hash it
     if (body.newPassword) {

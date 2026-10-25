@@ -269,11 +269,15 @@ export default function CombosPage() {
   };
 
   const persistComboStrategies = async (updated) => {
-    await fetch("/api/settings", {
+    const res = await fetch("/api/settings", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ comboStrategies: updated }),
     });
+    if (!res.ok) {
+      const data = await res.json();
+      throw new Error(data.error || "Failed to update combo strategies");
+    }
     setComboStrategies(updated);
   };
 
@@ -342,6 +346,9 @@ export default function CombosPage() {
     try {
       const updated = { ...comboStrategies };
       const next = { ...(updated[comboName] || {}), ...patch };
+      if (patch.fusionTuning) {
+        next.fusionTuning = { ...updated[comboName]?.fusionTuning, ...patch.fusionTuning };
+      }
       // Prune to keep settings clean: default fallback with no extras = no entry.
       if (!next.fallbackStrategy || next.fallbackStrategy === "fallback") {
         delete updated[comboName];
@@ -352,6 +359,7 @@ export default function CombosPage() {
       await persistComboStrategies(updated);
     } catch (error) {
       console.log("Error updating combo strategy:", error);
+      alert(error.message || "Failed to update combo strategy");
     }
   };
 
@@ -664,6 +672,11 @@ function ComboCard({ combo, getCaps, comboByName = {}, activeProviders = [], cop
   const routerModel = strategy.routerModel || "";
   const isFusion = current === "fusion";
   const isSmart = current === "smart";
+  const panelCount = combo.models.length;
+  const tuning = strategy.fusionTuning || {};
+  const maxPanels = Number.isInteger(tuning.maxPanels) ? Math.max(0, Math.min(panelCount, tuning.maxPanels)) : panelCount;
+  const minPanels = Number.isInteger(tuning.minPanels) ? Math.max(0, Math.min(maxPanels, tuning.minPanels)) : maxPanels;
+  const panelOptions = Array.from({ length: panelCount + 1 }, (_, value) => ({ value, label: String(value) }));
   // The synced catalog is server-only, so resolving here would fall back to the
   // generic patterns and under-report the limits. getCaps carries the server's
   // answer for /api/models.
@@ -735,6 +748,40 @@ function ComboCard({ combo, getCaps, comboByName = {}, activeProviders = [], cop
                     <span className="material-symbols-outlined text-[13px]">close</span>
                   </button>
                 )}
+              </div>
+            )}
+            {isFusion && (
+              <div className="mt-2 space-y-1.5">
+                <div className="flex flex-wrap items-center gap-2 text-[11px] text-text-muted">
+                  <label className="flex items-center gap-1.5">
+                    <span>Min panels</span>
+                    <Select
+                      aria-label={`Minimum panels for ${combo.name}`}
+                      value={minPanels}
+                      options={panelOptions.filter(({ value }) => value <= maxPanels)}
+                      onChange={(e) => onSetStrategy({ fusionTuning: { minPanels: Number(e.target.value), maxPanels } })}
+                      selectClassName="py-1 text-xs"
+                      className="w-20"
+                    />
+                  </label>
+                  <label className="flex items-center gap-1.5">
+                    <span>Max panels</span>
+                    <Select
+                      aria-label={`Maximum panels for ${combo.name}`}
+                      value={maxPanels}
+                      options={panelOptions.filter(({ value }) => value >= minPanels)}
+                      onChange={(e) => onSetStrategy({ fusionTuning: { minPanels, maxPanels: Number(e.target.value) } })}
+                      selectClassName="py-1 text-xs"
+                      className="w-20"
+                    />
+                  </label>
+                  <span>of {panelCount} slots</span>
+                </div>
+                <p className="text-[11px] text-text-muted">
+                  All selected panel slots run in parallel. {minPanels === 0
+                    ? "Direct judge responses allowed (min = 0)."
+                    : "Set min to 0 to allow direct judge responses."}
+                </p>
               </div>
             )}
             {/* Smart: System One router picker and policy modal trigger */}
