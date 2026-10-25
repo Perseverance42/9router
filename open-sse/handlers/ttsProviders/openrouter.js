@@ -4,7 +4,7 @@ import { PROVIDER_MEDIA } from "../../providers/index.js";
 const TTS_CFG = PROVIDER_MEDIA["openrouter"]?.ttsConfig || {};
 
 export default {
-  async synthesize(text, model, credentials) {
+  async synthesize(text, model, credentials, responseFormat, { provider } = {}) {
     if (!credentials?.apiKey) throw new Error("No OpenRouter API key configured");
 
     // model format: "tts-model/voice" e.g. "openai/gpt-4o-mini-tts/alloy"
@@ -33,6 +33,7 @@ export default {
       },
       body: JSON.stringify({
         model: ttsModel,
+        ...(provider !== undefined ? { provider } : {}),
         modalities: ["text", "audio"],
         audio: { voice, format: "wav" },
         stream: true,

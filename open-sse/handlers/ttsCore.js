@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { createErrorResult } from "../utils/error.js";
 import { HTTP_STATUS } from "../config/runtimeConfig.js";
 import { getTtsAdapter, synthesizeViaConfig } from "./ttsProviders/index.js";
+import { applyOpenRouterRouting } from "../services/openrouterRouting.js";
 
 // Re-export voice fetchers + voices APIs for backward compat with existing routes
 export {
@@ -48,16 +49,25 @@ function createTtsResponse(base64Audio, format, responseFormat) {
  *
  * @returns {Promise<{success, response, status?, error?}>}
  */
-export async function handleTtsCore({ provider, model, input, credentials, responseFormat = "mp3", language, style }) {
+export async function handleTtsCore({ provider, model, input, credentials, responseFormat = "mp3", language, style, routingPolicy, requestProvider }) {
   if (!input?.trim()) {
     return createErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: input");
+  }
+
+  let providerPreferences;
+  if (provider === "openrouter") {
+    try {
+      providerPreferences = applyOpenRouterRouting({ provider: requestProvider }, routingPolicy, "completion").provider;
+    } catch (error) {
+      return createErrorResult(HTTP_STATUS.BAD_REQUEST, error.message);
+    }
   }
 
   try {
     // Special-case adapters (google-tts, edge-tts, local-device, elevenlabs, openai, openrouter, gemini, xiaomi-mimo)
     const adapter = getTtsAdapter(provider);
     if (adapter) {
-      const result = await adapter.synthesize(input.trim(), model, credentials, responseFormat, { language, style });
+      const result = await adapter.synthesize(input.trim(), model, credentials, responseFormat, { language, style, ...(provider === "openrouter" ? { provider: providerPreferences } : {}) });
       // Adapter may return a full {success, response} (legacy) or {base64, format}
       if (result.success !== undefined) return result;
       return createTtsResponse(result.base64, result.format, responseFormat);
