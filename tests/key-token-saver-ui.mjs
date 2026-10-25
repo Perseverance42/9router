@@ -50,12 +50,55 @@ try {
   const headroom = editor.getByRole("switch", { name: "Headroom", exact: true });
   assert.equal(await master.count(), 0);
   assert.equal(await editor.evaluate((el) => el.previousElementSibling?.getAttribute("data-testid")), "key-access");
+  await waitFor(() => override.isEnabled());
 
+  // Change server defaults after the dashboard has cached its initial settings.
+  assert.equal((await api.patch(`${base}/api/settings`, { data: { ...globals, rtkEnabled: false } })).ok(), true);
+  let settingsRequests = 0;
+  let activationSaves = 0;
+  const countActivationSave = (request) => {
+    if (request.url() === `${base}/api/keys/${key.id}` && request.method() === "PUT") activationSaves++;
+  };
+  page.on("request", countActivationSave);
+  await page.route("**/api/settings", (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    settingsRequests++;
+    return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Simulated refresh failure" }) });
+  });
   await override.click();
+  await editor.getByRole("alert").waitFor();
+  assert.match(await editor.getByRole("alert").innerText(), /Failed to refresh global token saver settings/);
+  assert.equal(await checked(override), false);
+  assert.equal(await master.count(), 0);
+  assert.equal(activationSaves, 0);
+  await page.unroute("**/api/settings");
+
+  let releaseRefresh;
+  let markRefreshStarted;
+  const refreshStarted = new Promise((resolve) => { markRefreshStarted = resolve; });
+  const heldRefresh = new Promise((resolve) => { releaseRefresh = resolve; });
+  await page.route("**/api/settings", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    settingsRequests++;
+    markRefreshStarted();
+    await heldRefresh;
+    await route.continue();
+  });
+  await override.click();
+  await refreshStarted;
+  assert.equal(await override.isDisabled(), true);
+  assert.equal(activationSaves, 0);
+  releaseRefresh();
   await waitFor(() => checked(override));
   assert.equal(await checked(master), true);
-  assert.equal(await checked(rtk), true);
+  assert.equal(await checked(rtk), false);
   assert.equal(await checked(headroom), false);
+  assert.equal(activationSaves, 1);
+  assert.equal(settingsRequests, 2);
+  page.off("request", countActivationSave);
+  await page.unroute("**/api/settings");
+  await rtk.click();
+  await waitFor(() => checked(rtk));
   await headroom.click();
   await waitFor(() => checked(headroom));
   assert.equal(await checked(rowFor(otherKeyName).getByRole("switch", { name: "Override token saver settings", exact: true })), false);
@@ -67,8 +110,15 @@ try {
   assert.equal(await checked(headroom), true);
   await override.click();
   await waitFor(async () => (await master.count()) === 0);
+  // Restoring saved choices must not depend on settings availability.
+  await page.route("**/api/settings", (route) => {
+    if (route.request().method() === "GET") settingsRequests++;
+    return route.fulfill({ status: 500, contentType: "application/json", body: "{}" });
+  });
   await override.click();
   await waitFor(() => checked(override));
+  assert.equal(settingsRequests, 2);
+  await page.unroute("**/api/settings");
   assert.equal(await checked(master), false);
   assert.equal(await checked(headroom), true);
   await master.click();
@@ -142,7 +192,7 @@ try {
   const shared = await (await api.get(`${base}/api/settings`)).json();
   assert.equal(shared.cavemanEnabled, false);
   assert.equal(shared.cavemanLevel, "lite");
-  console.log("PASS: inheritance, activation snapshot, master gating, retention/reload, key isolation, pending guard, error/retry, keyboard, mobile visibility, editing global-OFF levels");
+  console.log("PASS: inheritance, fresh activation snapshot, refresh failure/retry, refresh pending guard, reactivation without refresh, master gating, retention/reload, key isolation, save pending guard, error/retry, keyboard, mobile visibility, editing global-OFF levels");
 } finally {
   const cleanup = async (request) => {
     try {

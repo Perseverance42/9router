@@ -17,6 +17,11 @@ export default function TokenSaverControls({ value = null, globalSettings, onSav
     setSaving(true);
     setError("");
     try {
+      if (!value) {
+        const settings = await onReloadSettings();
+        if (!settings) throw new Error("Failed to refresh global token saver settings");
+        next = { ...next, ...resolveTokenSaverFlags(settings, null) };
+      }
       await onSave(next);
     } catch (err) {
       setError(err.message || "Failed to save token saver settings");
@@ -30,7 +35,7 @@ export default function TokenSaverControls({ value = null, globalSettings, onSav
     if (!value && !globalSettings) return;
     save(value
       ? { ...value, overrideEnabled }
-      : { overrideEnabled, enabled: true, ...resolveTokenSaverFlags(globalSettings, null) });
+      : { overrideEnabled, enabled: true });
   };
 
   return (
