@@ -4,6 +4,7 @@ const fx = vi.hoisted(() => ({ settings: {}, combos: {}, routing: {} }));
 const mocks = vi.hoisted(() => ({ handleChatCore: vi.fn(), getComboRouting: vi.fn() }));
 
 vi.mock("@/lib/localDb", () => ({ getSettings: async () => fx.settings }));
+vi.mock("@/lib/db/index.js", () => ({ getApiKeyByKey: async () => null }));
 vi.mock("@/sse/services/model.js", () => ({
   getComboModels: async (name) => fx.combos[name] || null,
   getComboRouting: mocks.getComboRouting,
@@ -24,6 +25,7 @@ vi.mock("@/sse/services/tokenRefresh.js", () => ({
   updateProviderCredentials: vi.fn(),
 }));
 vi.mock("@/sse/services/keyAccess.js", () => ({
+  extractClientApiKey: () => null,
   getKeyAccessContext: async () => null,
   enforceKeyAccess: async () => null,
   filterAdapterModels: async (_access, models) => models,
