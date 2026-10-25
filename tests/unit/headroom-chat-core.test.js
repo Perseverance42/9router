@@ -338,7 +338,10 @@ describe("handleChatCore Headroom diagnostics", () => {
     );
   });
 
-  it("bypasses token savers when requested by the client", async () => {
+  it.each([
+    { header: "off", enabled: true },
+    { header: "on", enabled: false },
+  ])("respects saver flags and request opt-out: %j", async ({ header, enabled }) => {
     const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn() };
     const pxpipeTransform = vi.fn();
     const messages = [{ role: "user", content: "Write polished prose." }];
@@ -353,13 +356,13 @@ describe("handleChatCore Headroom diagnostics", () => {
       credentials: { apiKey: "test-key", providerSpecificData: {} },
       log,
       connectionId: "test-conn",
-      headroomEnabled: true,
+      headroomEnabled: enabled,
       headroomUrl: "http://localhost:8787",
       headroomCompressUserMessages: true,
-      rtkEnabled: true,
-      cavemanEnabled: true,
+      rtkEnabled: enabled,
+      cavemanEnabled: enabled,
       cavemanLevel: "full",
-      ponytailEnabled: true,
+      ponytailEnabled: enabled,
       ponytailLevel: "full",
       pxpipeEnabled: true,
       pxpipeTransform,
@@ -368,7 +371,7 @@ describe("handleChatCore Headroom diagnostics", () => {
         body: {},
         headers: {
           accept: "application/json",
-          "x-9router-token-saver": "off",
+          "x-9router-token-saver": header,
         },
       },
     });
