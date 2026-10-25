@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Card, Button, Input, Toggle, ModelSelectModal } from "@/shared/components";
 import ProviderIcon from "@/shared/components/ProviderIcon";
+import OpenRouterComboRouting, { useOpenRouterComboRouting } from "@/shared/components/OpenRouterComboRouting";
 import { AI_PROVIDERS, MEDIA_PROVIDER_KINDS } from "@/shared/constants/providers";
 
 // Parse "providerId/model" or just "providerId" → { providerId, model }
@@ -329,6 +330,8 @@ export default function ComboDetailPage() {
         )}
       </Card>
 
+      {combo.kind !== "video" && <ComboRoutingEditor key={combo.id || id} combo={combo} models={providers} connections={connections} modelAliases={modelAliases} />}
+
       {/* Test Example Card */}
       {combo.kind && examplePath && (
         <Card>
@@ -407,6 +410,49 @@ export default function ComboDetailPage() {
           closeOnSelect={false}
         />
       )}
+    </div>
+  );
+}
+
+function ComboRoutingEditor({ combo, models, connections, modelAliases }) {
+  const routing = useOpenRouterComboRouting({ isOpen: true, combo, models, activeProviders: connections, modelAliases });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  const onChange = (value) => {
+    routing.onChange(value);
+    setSaved(false);
+    setError("");
+  };
+  const save = async () => {
+    if (saving || routing.blocked || !routing.visible) return;
+    setSaving(true);
+    setError("");
+    setSaved(false);
+    try {
+      const res = await fetch(`/api/combos/${combo.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ openrouterRouting: routing.routing }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || "Failed to save OpenRouter routing");
+      }
+      setSaved(true);
+    } catch (error) {
+      setError(error.message || "Failed to save OpenRouter routing");
+    } finally {
+      setSaving(false);
+    }
+  };
+  if (!routing.visible && !routing.pending && !routing.error) return null;
+  return (
+    <div className="space-y-3">
+      <OpenRouterComboRouting {...routing} onChange={onChange} disabled={saving} />
+      {error && <p role="alert" className="text-xs text-red-500">{error}</p>}
+      {saved && <p role="status" className="text-xs text-text-muted">OpenRouter routing saved.</p>}
+      {routing.visible && <Button size="sm" onClick={save} disabled={saving || routing.blocked}>{saving ? "Saving..." : "Save OpenRouter routing"}</Button>}
     </div>
   );
 }
