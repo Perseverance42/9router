@@ -56,6 +56,7 @@ export async function PUT(request, { params }) {
     return NextResponse.json(combo);
   } catch (error) {
     console.log("Error updating combo:", error);
+    if (error.status === 400) return NextResponse.json({ error: error.message }, { status: 400 });
     return NextResponse.json({ error: "Failed to update combo" }, { status: 500 });
   }
 }

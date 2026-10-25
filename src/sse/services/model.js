@@ -92,3 +92,7 @@ export async function getComboModels(modelStr) {
   }
   return null;
 }
+
+export async function getComboRouting(modelStr) {
+  return (await getComboByName(modelStr))?.openrouterRouting ?? null;
+}

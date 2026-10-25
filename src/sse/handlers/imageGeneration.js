@@ -6,7 +6,7 @@ import {
   isValidApiKey,
 } from "../services/auth.js";
 import { getSettings } from "@/lib/localDb";
-import { getModelInfo, getComboModels } from "../services/model.js";
+import { getModelInfo, getComboModels, getComboRouting } from "../services/model.js";
 import { getKeyAccessContext, enforceKeyAccess } from "../services/keyAccess.js";
 import { handleImageGenerationCore } from "open-sse/handlers/imageGenerationCore.js";
 import { getImageAdapter } from "open-sse/handlers/imageProviders/index.js";
@@ -14,7 +14,7 @@ import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { handleComboChat } from "open-sse/services/combo.js";
-import { applyOpenRouterRouting } from "open-sse/services/openrouterRouting.js";
+import { applyOpenRouterRouting, resolveOpenRouterComboRouting } from "open-sse/services/openrouterRouting.js";
 import * as log from "../utils/logger.js";
 import { saveRequestUsage } from "@/lib/usageDb.js";
 
@@ -78,13 +78,14 @@ export async function handleImageGeneration(request) {
   const comboModels = await getComboModels(modelStr);
   if (comboModels) {
     const comboStrategies = settings.comboStrategies || {};
+    const comboRouting = [await getComboRouting(modelStr)];
     const comboStrategy = comboStrategies[modelStr]?.fallbackStrategy || settings.comboStrategy || "fallback";
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
     log.info("IMAGE", `Combo "${modelStr}" with ${comboModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleModelImage(b, m, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint: url.pathname, settings }),
+      handleSingleModel: (b, m) => handleSingleModelImage(b, m, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint: url.pathname, settings, comboRouting }),
       log,
       comboName: modelStr,
       comboStrategy,
@@ -95,14 +96,32 @@ export async function handleImageGeneration(request) {
   return handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint: url.pathname, settings });
 }
 
-async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint, settings } = {}) {
+async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint, settings, comboRouting = [], comboPath = [] } = {}) {
   const modelInfo = await getModelInfo(modelStr);
+  if (!modelInfo.provider) {
+    const models = await getComboModels(modelStr);
+    if (models) {
+      if (comboPath.includes(modelStr)) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Circular image combo reference");
+      const cfg = settings.comboStrategies?.[modelStr];
+      const nestedRouting = [...comboRouting, await getComboRouting(modelStr)];
+      return handleComboChat({
+        body, models, log, comboName: modelStr,
+        comboStrategy: cfg?.fallbackStrategy || settings.comboStrategy || "fallback",
+        comboStickyLimit: settings.comboStickyRoundRobinLimit,
+        handleSingleModel: (b, m) => handleSingleModelImage(b, m, {
+          wantsStream, binaryOutput, preferredConnectionId, apiKey, endpoint, settings,
+          comboRouting: nestedRouting,
+          comboPath: [...comboPath, modelStr],
+        }),
+      });
+    }
+  }
   if (!modelInfo.provider) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
 
   const { provider, model } = modelInfo;
   if (provider === "openrouter") {
     try {
-      body = applyOpenRouterRouting(body, settings.providerOverrides?.openrouter?.routing, "image");
+      body = applyOpenRouterRouting(body, comboRouting.reduce(resolveOpenRouterComboRouting, settings.providerOverrides?.openrouter?.routing), "image");
     } catch (error) {
       return errorResponse(HTTP_STATUS.BAD_REQUEST, error.message);
     }
