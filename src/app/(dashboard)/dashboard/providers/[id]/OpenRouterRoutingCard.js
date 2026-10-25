@@ -138,7 +138,7 @@ export default function OpenRouterRoutingCard({ providerId }) {
                 <option value="custom">Custom</option>
               </select>
               <p className="text-xs text-text-muted">Allowed formats: {quantizations.length ? quantizations.join(", ") : "all formats (no precision filter)"}.</p>
-              <p className="text-xs text-text-muted">Precision filtering applies to completion, embedding, and System One routes, including current TTS audio completions. Dedicated image and video generation are not precision-filtered.</p>
+              <p className="text-xs text-text-muted">Precision filtering applies to completion, embedding, and System One routes, including current TTS audio completions. Saved precision filters skip proprietary Claude, GPT, Gemini, and Grok 3+ models with undisclosed precision; explicit request filters still apply. Open-weight GPT-OSS, Gemma, and Grok 1 remain filtered. Dedicated image and video generation are not precision-filtered.</p>
               {preset === "custom" && (
                 <fieldset className="flex flex-wrap gap-x-4 gap-y-2">
                   <legend className="mb-2 text-xs text-text-muted">Select allowed formats. Unknown explicitly permits routes with unspecified precision.</legend>

@@ -14,6 +14,16 @@ export const OPENROUTER_QUANTIZATION_FAMILIES = {
   fp8: ["fp8", "mxfp8"],
 };
 
+// Proprietary families whose serving precision is not published. Match models,
+// not entire vendors: GPT-OSS and Gemma must still obey the precision policy.
+// ponytail: explicit families only; extend when another family is verified.
+export const OPENROUTER_UNDISCLOSED_PRECISION_MODELS = [
+  /^anthropic\/claude(?:-|$)/,
+  /^openai\/(?:gpt-(?!oss(?:-|:|$))|chatgpt-|o[1-9](?:-|:|$)|text-embedding-)/,
+  /^google\/gemini-/,
+  /^x-ai\/grok-(?:[3-9](?:[.:-]|$)|build-)/,
+];
+
 export const OPENROUTER_ROUTING_ENDPOINTS = {
   completion: { precision: true, zdr: true },
   embedding: { precision: true, zdr: true },

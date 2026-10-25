@@ -2,7 +2,6 @@ import { Buffer } from "node:buffer";
 import { createErrorResult } from "../utils/error.js";
 import { HTTP_STATUS } from "../config/runtimeConfig.js";
 import { getTtsAdapter, synthesizeViaConfig } from "./ttsProviders/index.js";
-import { applyOpenRouterRouting } from "../services/openrouterRouting.js";
 
 // Re-export voice fetchers + voices APIs for backward compat with existing routes
 export {
@@ -54,20 +53,11 @@ export async function handleTtsCore({ provider, model, input, credentials, respo
     return createErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: input");
   }
 
-  let providerPreferences;
-  if (provider === "openrouter") {
-    try {
-      providerPreferences = applyOpenRouterRouting({ provider: requestProvider }, routingPolicy, "completion").provider;
-    } catch (error) {
-      return createErrorResult(HTTP_STATUS.BAD_REQUEST, error.message);
-    }
-  }
-
   try {
     // Special-case adapters (google-tts, edge-tts, local-device, elevenlabs, openai, openrouter, gemini, xiaomi-mimo)
     const adapter = getTtsAdapter(provider);
     if (adapter) {
-      const result = await adapter.synthesize(input.trim(), model, credentials, responseFormat, { language, style, ...(provider === "openrouter" ? { provider: providerPreferences } : {}) });
+      const result = await adapter.synthesize(input.trim(), model, credentials, responseFormat, { language, style, ...(provider === "openrouter" ? { provider: requestProvider, routingPolicy } : {}) });
       // Adapter may return a full {success, response} (legacy) or {base64, format}
       if (result.success !== undefined) return result;
       return createTtsResponse(result.base64, result.format, responseFormat);
@@ -79,6 +69,6 @@ export async function handleTtsCore({ provider, model, input, credentials, respo
 
     return createErrorResult(HTTP_STATUS.BAD_REQUEST, `Provider '${provider}' does not support TTS via this route.`);
   } catch (err) {
-    return createErrorResult(HTTP_STATUS.BAD_GATEWAY, err.message || "TTS synthesis failed");
+    return createErrorResult(err.status === HTTP_STATUS.BAD_REQUEST ? HTTP_STATUS.BAD_REQUEST : HTTP_STATUS.BAD_GATEWAY, err.message || "TTS synthesis failed");
   }
 }

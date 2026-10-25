@@ -25,7 +25,7 @@ describe("OpenRouter media egress", () => {
       modelInfo: { provider: "openrouter", model: "openai/text-embedding-3-small" },
       credentials: { apiKey: "test" }, routingPolicy: { zdr: true, quantizations: ["fp8"] },
     });
-    expect(JSON.parse(fetchMock.mock.calls[0][1].body).provider).toEqual({ sort: "latency", zdr: true, quantizations: ["fp8"] });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).provider).toEqual({ sort: "latency", zdr: true });
   });
 
   it("forwards policy through the separate TTS audio-completion adapter", async () => {
@@ -33,13 +33,32 @@ describe("OpenRouter media egress", () => {
     vi.stubGlobal("fetch", fetchMock);
     const result = await handleTtsCore({ provider: "openrouter", model: "openai/gpt-4o-mini-tts/alloy", input: "hello", credentials: { apiKey: "test" }, routingPolicy: { zdr: true, quantizations: ["bf16"] } });
     expect(result.success).toBe(true);
-    expect(JSON.parse(fetchMock.mock.calls[0][1].body).provider).toEqual({ zdr: true, quantizations: ["bf16"] });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).provider).toEqual({ zdr: true });
+  });
+
+  it("still restricts open-weight embedding models", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: [], usage: {} })));
+    vi.stubGlobal("fetch", fetchMock);
+    await handleEmbeddingsCore({
+      body: { input: "hello" },
+      modelInfo: { provider: "openrouter", model: "qwen/qwen3-embedding-8b" },
+      credentials: { apiKey: "test" }, routingPolicy: { quantizations: ["bf16"] },
+    });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).provider).toEqual({ quantizations: ["bf16"] });
+  });
+
+  it("preserves explicit TTS precision filters for proprietary models", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('data: {"choices":[{"delta":{"audio":{"data":"YQ=="}}}]}\n\ndata: [DONE]\n\n'));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await handleTtsCore({ provider: "openrouter", input: "hello", credentials: { apiKey: "test" }, routingPolicy: { quantizations: ["bf16"] }, requestProvider: { quantizations: ["unknown"] } });
+    expect(result.success).toBe(true);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).provider).toEqual({ quantizations: ["unknown"] });
   });
 
   it("rejects conflicting TTS policy before network I/O", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
-    const result = await handleTtsCore({ provider: "openrouter", input: "hello", routingPolicy: { quantizations: ["bf16"] }, requestProvider: { quantizations: ["fp4"] } });
+    const result = await handleTtsCore({ provider: "openrouter", model: "vendor/open-model/alloy", input: "hello", credentials: { apiKey: "test" }, routingPolicy: { quantizations: ["bf16"] }, requestProvider: { quantizations: ["fp4"] } });
     expect(result.status).toBe(400);
     expect(fetchMock).not.toHaveBeenCalled();
   });

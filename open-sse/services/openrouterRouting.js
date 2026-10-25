@@ -2,6 +2,7 @@ import {
   OPENROUTER_QUANTIZATIONS,
   OPENROUTER_QUANTIZATION_FAMILIES,
   OPENROUTER_ROUTING_ENDPOINTS,
+  OPENROUTER_UNDISCLOSED_PRECISION_MODELS,
 } from "../config/openrouterRouting.js";
 
 function invalid(message) {
@@ -63,7 +64,10 @@ export function applyOpenRouterRouting(body, policy, endpoint) {
     return body;
   }
   if (requiresZdr) preferences.zdr = true;
-  if (capabilities.precision && configured.quantizations) {
+  const models = [body.model, ...(Array.isArray(body.models) ? body.models : [])].filter(model => model != null);
+  const undisclosedPrecision = models.length > 0 && models.every(model => typeof model === "string"
+    && OPENROUTER_UNDISCLOSED_PRECISION_MODELS.some(pattern => pattern.test(model)));
+  if (capabilities.precision && configured.quantizations && !undisclosedPrecision) {
     preferences.quantizations = requestedFormats
       ? intersectFormats(configured.quantizations, requestedFormats)
       : [...configured.quantizations];

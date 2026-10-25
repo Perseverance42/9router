@@ -21,6 +21,47 @@ describe("OpenRouter routing policy", () => {
     expect(body.provider.zdr).toBe(false);
   });
 
+  it.each(["completion", "embedding", "systemone"])("skips saved precision for proprietary models on %s, retaining ZDR", endpoint => {
+    for (const model of ["anthropic/claude-sonnet-4.5", "anthropic/claude-opus-4.1:nitro", "openai/gpt-5", "openai/chatgpt-4o-latest", "openai/o3", "openai/text-embedding-3-small", "google/gemini-2.5-pro", "x-ai/grok-4.7"]) {
+      const body = Object.freeze({ model, provider: Object.freeze({ zdr: false, sort: "latency" }) });
+      expect(applyOpenRouterRouting(body, { zdr: true, quantizations: ["bf16"] }, endpoint))
+        .toEqual({ model, provider: { zdr: true, sort: "latency" } });
+      expect(body.provider).toEqual({ zdr: false, sort: "latency" });
+    }
+  });
+
+  it("preserves explicit proprietary-model filters without intersecting the saved policy", () => {
+    const body = { model: "anthropic/claude-sonnet-4.5", provider: { quantizations: ["unknown"], only: ["anthropic"] } };
+    expect(applyOpenRouterRouting(body, { quantizations: ["bf16"], zdr: true }, "completion").provider)
+      .toEqual({ quantizations: ["unknown"], only: ["anthropic"], zdr: true });
+    expect(applyOpenRouterRouting({ model: body.model }, { quantizations: ["bf16"] }, "completion"))
+      .toEqual({ model: body.model });
+    expect(() => applyOpenRouterRouting({ model: body.model, provider: { quantizations: [] } }, { quantizations: ["bf16"] }, "completion"))
+      .toThrow(/non-empty/);
+  });
+
+  it.each(["openai/gpt-oss-120b", "openai/gpt-oss-20b:free", "google/gemma-3-27b-it", "x-ai/grok-1", "deepseek/deepseek-r1", "vendor/claude-copy", "anthropic/other", "openai/gpt-oss", "openai/gpt-oss:free", "vendor/model"])("still enforces precision on %s", model => {
+    expect(applyOpenRouterRouting({ model }, { quantizations: ["bf16"] }, "completion").provider)
+      .toEqual({ quantizations: ["bf16"] });
+    expect(() => applyOpenRouterRouting({ model, provider: { quantizations: ["fp4"] } }, { quantizations: ["bf16"] }, "completion"))
+      .toThrow(/conflict/);
+  });
+
+  it("exempts only wholly proprietary fallback lists, not mixed or unspecified targets", () => {
+    const policy = { quantizations: ["bf16"] };
+    const closed = { models: ["anthropic/claude-sonnet-4.5", "openai/gpt-5"] };
+    expect(applyOpenRouterRouting(closed, policy, "completion")).toBe(closed);
+    for (const body of [
+      { models: [] },
+      { models: ["anthropic/claude-sonnet-4.5", "openai/gpt-oss-120b"] },
+      { model: "openai/gpt-oss-120b", models: closed.models },
+      { model: "openrouter/auto" },
+      {},
+    ]) {
+      expect(applyOpenRouterRouting(body, policy, "completion").provider).toEqual(policy);
+    }
+  });
+
   it("narrows requested precision with family-aware matching", () => {
     expect(applyOpenRouterRouting({ provider: { quantizations: ["mxfp8", "fp4"] } }, { quantizations: ["fp8"] }, "completion").provider.quantizations).toEqual(["mxfp8"]);
     expect(applyOpenRouterRouting({ provider: { quantizations: ["fp4"] } }, { quantizations: ["nvfp4"] }, "completion").provider.quantizations).toEqual(["nvfp4"]);
