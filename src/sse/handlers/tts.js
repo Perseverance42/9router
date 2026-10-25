@@ -3,13 +3,14 @@ import {
   getProviderCredentials, markAccountUnavailable,
 } from "../services/auth.js";
 import { getSettings } from "@/lib/localDb";
-import { getModelInfo, getComboModels } from "../services/model.js";
+import { getModelInfo, getComboModels, getComboRouting } from "../services/model.js";
 import { getKeyAccessContext, enforceKeyAccess } from "../services/keyAccess.js";
 import { handleTtsCore } from "open-sse/handlers/ttsCore.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { AI_PROVIDERS } from "@/shared/constants/providers";
 import { handleComboChat } from "open-sse/services/combo.js";
+import { resolveOpenRouterComboRouting } from "open-sse/services/openrouterRouting.js";
 import * as log from "../utils/logger.js";
 
 // Derived from providers.js: any TTS provider not noAuth requires stored credentials
@@ -53,13 +54,14 @@ export async function handleTts(request) {
   const comboModels = await getComboModels(modelStr);
   if (comboModels) {
     const comboStrategies = settings.comboStrategies || {};
+    const comboRouting = [await getComboRouting(modelStr)];
     const comboStrategy = comboStrategies[modelStr]?.fallbackStrategy || settings.comboStrategy || "fallback";
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
     log.info("TTS", `Combo "${modelStr}" with ${comboModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleModelTts(b, m, responseFormat, language, style, settings),
+      handleSingleModel: (b, m) => handleSingleModelTts(b, m, responseFormat, language, style, settings, comboRouting),
       log,
       comboName: modelStr,
       comboStrategy,
@@ -70,16 +72,33 @@ export async function handleTts(request) {
   return handleSingleModelTts(body, modelStr, responseFormat, language, style, settings);
 }
 
-async function handleSingleModelTts(body, modelStr, responseFormat, language, style, settings) {
+async function handleSingleModelTts(body, modelStr, responseFormat, language, style, settings, comboRouting = [], comboPath = []) {
   const modelInfo = await getModelInfo(modelStr);
+  if (!modelInfo.provider) {
+    const models = await getComboModels(modelStr);
+    if (models) {
+      if (comboPath.includes(modelStr)) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Circular TTS combo reference");
+      const cfg = settings.comboStrategies?.[modelStr];
+      const nestedRouting = [...comboRouting, await getComboRouting(modelStr)];
+      return handleComboChat({
+        body, models, log, comboName: modelStr,
+        comboStrategy: cfg?.fallbackStrategy || settings.comboStrategy || "fallback",
+        comboStickyLimit: settings.comboStickyRoundRobinLimit,
+        handleSingleModel: (b, m) => handleSingleModelTts(b, m, responseFormat, language, style, settings, nestedRouting, [...comboPath, modelStr]),
+      });
+    }
+  }
   if (!modelInfo.provider) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
 
   const { provider, model } = modelInfo;
+  const routingPolicy = provider === "openrouter"
+    ? comboRouting.reduce(resolveOpenRouterComboRouting, settings.providerOverrides?.openrouter?.routing)
+    : undefined;
   log.info("ROUTING", `Provider: ${provider}, Voice: ${model}`);
 
   // noAuth providers — no credential needed
   if (!CREDENTIALED_PROVIDERS.has(provider)) {
-    const result = await handleTtsCore({ provider, model, input: body.input, responseFormat, language, style, routingPolicy: settings.providerOverrides?.openrouter?.routing, requestProvider: body.provider });
+    const result = await handleTtsCore({ provider, model, input: body.input, responseFormat, language, style, routingPolicy, requestProvider: body.provider });
     if (result.success) return result.response;
     return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "TTS failed");
   }
@@ -104,7 +123,7 @@ async function handleSingleModelTts(body, modelStr, responseFormat, language, st
 
     log.info("AUTH", `\x1b[32mUsing ${provider} account: ${credentials.connectionName}\x1b[0m`);
 
-    const result = await handleTtsCore({ provider, model, input: body.input, credentials, responseFormat, language, style, routingPolicy: settings.providerOverrides?.openrouter?.routing, requestProvider: body.provider });
+    const result = await handleTtsCore({ provider, model, input: body.input, credentials, responseFormat, language, style, routingPolicy, requestProvider: body.provider });
 
     if (result.success) return result.response;
 

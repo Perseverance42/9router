@@ -5,6 +5,7 @@ import Modal from "./Modal";
 import Input from "./Input";
 import Button from "./Button";
 import ModelSelectModal from "./ModelSelectModal";
+import OpenRouterComboRouting, { useOpenRouterComboRouting } from "./OpenRouterComboRouting";
 
 const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
 
@@ -50,7 +51,7 @@ function ModelItem({ index, model, isFirst, isLast, onEdit, onMoveUp, onMoveDown
 }
 
 // Reusable Combo create/edit modal. forcePrefix auto-prepends to name.
-export default function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindFilter = null, forcePrefix = "", title }) {
+export default function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindFilter = null, forcePrefix = "", title, comboByName }) {
   // Strip prefix when editing existing combo so user only edits suffix
   const initialName = combo?.name
     ? (forcePrefix && combo.name.startsWith(forcePrefix) ? combo.name.slice(forcePrefix.length) : combo.name)
@@ -61,6 +62,8 @@ export default function ComboFormModal({ isOpen, combo, onClose, onSave, activeP
   const [saving, setSaving] = useState(false);
   const [nameError, setNameError] = useState("");
   const [modelAliases, setModelAliases] = useState({});
+  const [saveError, setSaveError] = useState("");
+  const routing = useOpenRouterComboRouting({ isOpen, combo, models, activeProviders, modelAliases, comboByName });
 
   useEffect(() => {
     if (!isOpen) return;
@@ -100,10 +103,16 @@ export default function ComboFormModal({ isOpen, combo, onClose, onSave, activeP
   };
 
   const handleSave = async () => {
-    if (!validateName(name)) return;
+    if (saving || routing.blocked || !validateName(name)) return;
     setSaving(true);
-    await onSave({ name: forcePrefix + name.trim(), models });
-    setSaving(false);
+    setSaveError("");
+    try {
+      await onSave({ name: forcePrefix + name.trim(), models, openrouterRouting: routing.visible ? routing.routing : combo?.openrouterRouting ?? null });
+    } catch (error) {
+      setSaveError(error.message || "Failed to save combo");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const isEdit = !!combo;
@@ -157,9 +166,11 @@ export default function ComboFormModal({ isOpen, combo, onClose, onSave, activeP
             </button>
           </div>
 
+          <OpenRouterComboRouting {...routing} disabled={saving} />
+          {saveError && <p role="alert" className="text-xs text-red-500">{saveError}</p>}
           <div className="flex flex-col gap-2 pt-1 sm:flex-row">
             <Button onClick={onClose} variant="ghost" fullWidth size="sm">Cancel</Button>
-            <Button onClick={handleSave} fullWidth size="sm" disabled={!name.trim() || !!nameError || saving}>
+            <Button onClick={handleSave} fullWidth size="sm" disabled={!name.trim() || !!nameError || saving || routing.blocked}>
               {saving ? "Saving..." : isEdit ? "Save" : "Create"}
             </Button>
           </div>

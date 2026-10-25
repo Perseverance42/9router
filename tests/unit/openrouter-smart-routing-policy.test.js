@@ -20,3 +20,15 @@ it("enforces saved OpenRouter policy on internal Smart Router inference", async 
   expect(fetchMock).toHaveBeenCalledOnce();
   expect(JSON.parse(fetchMock.mock.calls[0][1].body).provider).toEqual({ zdr: true, quantizations: ["bf16"] });
 });
+
+it("applies combo precision to classification while retaining provider ZDR", async () => {
+  const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ answers: {} })));
+  vi.stubGlobal("fetch", fetchMock);
+  await resolveSmartChoice({
+    body: { messages: [{ role: "user", content: "Choose a model" }] },
+    models: ["openrouter/vendor/model-a", "openrouter/vendor/model-b"],
+    routerModel: "openrouter/typesafe/jev-1.13",
+    comboRouting: [{ quantizations: [] }],
+  });
+  expect(JSON.parse(fetchMock.mock.calls[0][1].body).provider).toEqual({ zdr: true });
+});

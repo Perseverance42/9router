@@ -17,7 +17,7 @@ const PROTECTED_SETTING_KEYS = ["password", "mitmSudoEncrypted"];
 export async function GET() {
   try {
     const settings = await getSettings();
-    const { password, oidcClientSecret, ...safeSettings } = settings;
+    const { password, oidcClientSecret, comboOpenrouterRouting, ...safeSettings } = settings;
     safeSettings.oidcConfigured = !!(safeSettings.oidcIssuerUrl && safeSettings.oidcClientId && oidcClientSecret);
     
     const enableRequestLogs = process.env.ENABLE_REQUEST_LOGS === "true";
@@ -38,6 +38,9 @@ export async function GET() {
 export async function PATCH(request) {
   try {
     const body = await request.json();
+    if (Object.hasOwn(body, "comboOpenrouterRouting")) {
+      return NextResponse.json({ error: "Update OpenRouter combo routing through the combos API" }, { status: 400 });
+    }
 
     // Strip protected secrets before any internal handling sets them
     for (const key of PROTECTED_SETTING_KEYS) delete body[key];
@@ -108,11 +111,11 @@ export async function PATCH(request) {
         .catch((error) => console.warn("[AutoPing] settings update failed:", error.message));
     }
 
-    const { password, oidcClientSecret, ...safeSettings } = settings;
+    const { password, oidcClientSecret, comboOpenrouterRouting, ...safeSettings } = settings;
     safeSettings.oidcConfigured = !!(safeSettings.oidcIssuerUrl && safeSettings.oidcClientId && oidcClientSecret);
     return NextResponse.json(safeSettings, { headers: SETTINGS_RESPONSE_HEADERS });
   } catch (error) {
     console.log("Error updating settings:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ error: error.message }, { status: error.status === 400 ? 400 : 500 });
   }
 }

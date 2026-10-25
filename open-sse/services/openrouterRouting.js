@@ -33,6 +33,40 @@ export function normalizeOpenRouterRouting(value) {
   return Object.keys(result).length ? result : null;
 }
 
+export function normalizeOpenRouterComboRouting(value) {
+  if (value === null) return null;
+  object(value, "OpenRouter combo routing policy");
+  const result = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === "quantizations") {
+      result[key] = Array.isArray(entry) && entry.length === 0 ? [] : quantizations(entry);
+    } else if (key === "zdr") {
+      if (entry !== true) invalid("OpenRouter combo zdr must be true or omitted");
+      result[key] = true;
+    } else if (["allowImageWithoutZdr", "allowVideoWithoutZdr"].includes(key)) {
+      if (typeof entry !== "boolean") invalid(`OpenRouter ${key} must be a boolean`);
+      result[key] = entry;
+    } else invalid(`Unknown OpenRouter routing setting: ${key}`);
+  }
+  return Object.keys(result).length ? result : null;
+}
+
+export function resolveOpenRouterComboRouting(providerPolicy, comboOverride) {
+  const provider = normalizeOpenRouterRouting(providerPolicy ?? null) || {};
+  const combo = normalizeOpenRouterComboRouting(comboOverride ?? null) || {};
+  const result = { ...provider };
+  if (combo.zdr) result.zdr = true;
+  if (Object.hasOwn(combo, "quantizations")) {
+    if (combo.quantizations.length) result.quantizations = combo.quantizations;
+    else delete result.quantizations;
+  }
+  for (const key of ["allowImageWithoutZdr", "allowVideoWithoutZdr"]) {
+    if (provider[key] && combo[key] !== false) result[key] = true;
+    else delete result[key];
+  }
+  return Object.keys(result).length ? result : null;
+}
+
 function intersectFormats(configured, requested) {
   const expand = q => OPENROUTER_QUANTIZATION_FAMILIES[q] || [q];
   const allowed = new Set(configured.flatMap(expand));

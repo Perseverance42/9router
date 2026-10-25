@@ -10,6 +10,7 @@ import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { useModelCaps } from "@/shared/hooks/useModelCaps";
 import { aggregateComboCapabilities } from "open-sse/providers/capabilities.js";
 import { resolveProviderId, AI_PROVIDERS } from "@/shared/constants/providers";
+import OpenRouterComboRouting, { useOpenRouterComboRouting } from "@/shared/components/OpenRouterComboRouting";
 
 // Validate combo name: only a-z, A-Z, 0-9, -, _
 const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
@@ -236,10 +237,11 @@ export default function CombosPage() {
         setShowCreateModal(false);
       } else {
         const err = await res.json();
-        alert(err.error || "Failed to create combo");
+        throw new Error(err.error || "Failed to create combo");
       }
     } catch (error) {
       console.log("Error creating combo:", error);
+      throw new Error("Failed to create combo. Check your connection and try again.");
     }
   };
 
@@ -255,10 +257,11 @@ export default function CombosPage() {
         setEditingCombo(null);
       } else {
         const err = await res.json();
-        alert(err.error || "Failed to update combo");
+        throw new Error(err.error || "Failed to update combo");
       }
     } catch (error) {
       console.log("Error updating combo:", error);
+      throw new Error("Failed to update combo. Check your connection and try again.");
     }
   };
 
@@ -595,6 +598,7 @@ export default function CombosPage() {
           onClose={() => setShowCreateModal(false)}
           onSave={handleCreate}
           activeProviders={activeProviders}
+          combos={combos}
         />
       )}
 
@@ -606,6 +610,7 @@ export default function CombosPage() {
           onClose={() => setEditingCombo(null)}
           onSave={(data) => handleUpdate(editingCombo.id, data)}
           activeProviders={activeProviders}
+          combos={combos}
         />
       )}
 
@@ -1177,7 +1182,7 @@ function ModelItem({ id, index, model, isFirst, isLast, onEdit, onMoveUp, onMove
   );
 }
 
-function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindFilter = null }) {
+function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindFilter = null, combos }) {
   // Initialize state with combo values - key prop on parent handles reset on remount
   const [name, setName] = useState(combo?.name || "");
   const [models, setModels] = useState(combo?.models || []);
@@ -1185,6 +1190,9 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
   const [saving, setSaving] = useState(false);
   const [nameError, setNameError] = useState("");
   const [modelAliases, setModelAliases] = useState({});
+  const [saveError, setSaveError] = useState("");
+  const [comboByName] = useState(() => Object.fromEntries((combos || []).map((c) => [c.name, c.models])));
+  const routing = useOpenRouterComboRouting({ isOpen, combo, models, activeProviders, modelAliases, comboByName });
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -1269,10 +1277,16 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
   };
 
   const handleSave = async () => {
-    if (!validateName(name)) return;
+    if (saving || routing.blocked || !validateName(name)) return;
     setSaving(true);
-    await onSave({ name: name.trim(), models });
-    setSaving(false);
+    setSaveError("");
+    try {
+      await onSave({ name: name.trim(), models, openrouterRouting: routing.visible ? routing.routing : combo?.openrouterRouting ?? null });
+    } catch (error) {
+      setSaveError(error.message || "Failed to save combo");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const isEdit = !!combo;
@@ -1346,6 +1360,8 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
           </div>
 
           {/* Actions */}
+          <OpenRouterComboRouting {...routing} disabled={saving} />
+          {saveError && <p role="alert" className="text-xs text-red-500">{saveError}</p>}
           <div className="flex flex-col gap-2 pt-1 sm:flex-row">
             <Button onClick={onClose} variant="ghost" fullWidth size="sm">
               Cancel
@@ -1354,7 +1370,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, kindF
               onClick={handleSave}
               fullWidth
               size="sm"
-              disabled={!name.trim() || !!nameError || saving}
+              disabled={!name.trim() || !!nameError || saving || routing.blocked}
             >
               {saving ? "Saving..." : isEdit ? "Save" : "Create"}
             </Button>
