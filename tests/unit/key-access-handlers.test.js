@@ -8,6 +8,7 @@ const fx = vi.hoisted(() => ({
     { id: "c1", name: "Main", models: ["openai/model-a", "openai/model-b"] },
   ],
   keys: {},
+  settings: {},
 }));
 const mocks = vi.hoisted(() => ({
   getProviderCredentials: vi.fn(),
@@ -15,7 +16,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/localDb", () => ({
-  getSettings: async () => ({ requireApiKey: false, comboStrategy: "fallback" }),
+  getSettings: async () => ({ requireApiKey: false, comboStrategy: "fallback", ...fx.settings }),
   getModelAliases: async () => ({}),
   getComboByName: async (name) => fx.combos.find((c) => c.name === name) || null,
   getProviderNodes: async () => [],
@@ -74,6 +75,7 @@ const post = (path, body, k, extra = {}) => new Request(`http://localhost${path}
 
 beforeEach(() => {
   vi.clearAllMocks();
+  fx.settings = {};
   fx.keys = {
     "sk-open": { id: "o", name: "open", isActive: true, access: { restricted: false, allow: [] } },
     "sk-combo": { id: "c", name: "combo", isActive: true, access: { restricted: true, allow: ["Main"] } },
@@ -104,6 +106,27 @@ const chat = (model, k) => handleChat(post("/v1/chat/completions", { model, stre
 describe("chat (/v1/chat/completions, /v1/messages, /v1/responses all use handleChat)", () => {
   beforeEach(() => mocks.getProviderCredentials.mockResolvedValue({ connectionId: "conn", connectionName: "mock" }));
 
+  it("rejects an unlisted external Fusion judge before any credential or model call", async () => {
+    fx.settings = { comboStrategies: { Main: { fallbackStrategy: "fusion", judgeModel: "openai/external" } } };
+    const result = await chat("Main", "sk-combo");
+    expect(result.status).toBe(403);
+    expect((await result.json()).error.message).toContain("openai/external");
+    expect(mocks.getProviderCredentials).not.toHaveBeenCalled();
+    expect(mocks.handleChatCore).not.toHaveBeenCalled();
+  });
+  it.each(["member", "external", "unrestricted"])("permits an authorized Fusion %s judge", async (kind) => {
+    const judge = kind === "member" ? "openai/model-b" : "openai/external";
+    fx.settings = { comboStrategies: { Main: { fallbackStrategy: "fusion", judgeModel: judge, fusionTuning: { minPanels: 0, maxPanels: 0 } } } };
+    if (kind === "external") fx.keys["sk-combo"].access.allow.push(judge);
+    mocks.handleChatCore.mockImplementation(async ({ modelInfo }) => ({ success: true, response: Response.json({
+      id: "chatcmpl-direct", model: modelInfo.model, created: 1, object: "chat.completion",
+      choices: [{ index: 0, message: { role: "assistant", content: "Direct" }, finish_reason: "stop" }],
+    }) }));
+    const result = await chat("Main", kind === "unrestricted" ? "sk-open" : "sk-combo");
+    expect(result.status).toBe(200);
+    expect(mocks.handleChatCore).toHaveBeenCalledTimes(1);
+    expect(mocks.handleChatCore.mock.calls[0][0].modelInfo.model).toBe(judge.split("/")[1]);
+  });
   it("unrestricted key reaches the provider for the combo and models", async () => {
     for (const m of ["Main", "openai/model-b"]) {
       expect((await chat(m, "sk-open")).status).toBe(200);

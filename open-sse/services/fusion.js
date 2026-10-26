@@ -212,8 +212,9 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
         if (answerValidator && !answerValidator(value)) throw new FusionError("Judge answer violates requested output schema", stage);
       }
     };
-    await abortable(() => preflight?.([...new Set([...models, judge])], original), controller.signal);
+    const rejected = await abortable(() => preflight?.([...new Set([...models, judge])], original), controller.signal);
     checkAbort();
+    if (rejected instanceof Response) return rejected;
     const base = { ...original, stream: false };
     delete base.stream_options;
     const initial = structuredClone(base);

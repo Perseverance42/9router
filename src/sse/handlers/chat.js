@@ -122,7 +122,7 @@ export async function handleChat(request, clientRawRequest = null) {
       return handleFusionChat({
         body,
         models: comboModels,
-        ...fusionExecutionContext(body, clientRawRequest, request, apiKey),
+        ...fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels),
         log,
         comboName: modelStr,
         judgeModel: comboStrategies[modelStr]?.judgeModel,
@@ -181,13 +181,18 @@ export async function handleChat(request, clientRawRequest = null) {
   return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null);
 }
 
-function fusionExecutionContext(body, clientRawRequest, request, apiKey) {
+function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels) {
   return {
     signal: request?.signal,
     sourceFormat: request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) || undefined : undefined,
     preflight: async (models, canonical) => {
       const required = detectRequiredCapabilities(canonical);
       for (const target of models) {
+        // A combo grants its members, not an independently configured judge.
+        if (!comboModels.includes(target)) {
+          const denied = await enforceKeyAccess(keyAccess, target);
+          if (denied) return denied;
+        }
         const info = await getModelInfo(target);
         if (!info.provider) throw new Error(`Nested combo is not supported in Fusion: ${target}`);
         const caps = getCapabilitiesForModel(info.provider, info.model);
@@ -232,7 +237,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         return handleFusionChat({
           body,
           models: comboModels,
-          ...fusionExecutionContext(body, clientRawRequest, request, apiKey),
+          ...fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels),
           log,
           comboName: modelStr,
           judgeModel: comboStrategies[modelStr]?.judgeModel,
