@@ -220,7 +220,9 @@ function convertClaudeMessage(msg) {
           toolResults.push({
             role: ROLE.TOOL,
             tool_call_id: block.tool_use_id,
-            content: resultContent
+            // OpenAI has no native error flag. Keep the observed execution status
+            // in-band so every downstream provider receives it with the result.
+            content: block.is_error === true ? `[Tool execution failed (is_error=true)]\n${resultContent}` : resultContent
           });
           // The OpenAI tool role is text-only, so a screenshot or any other image a
           // tool returned would otherwise vanish. Hand it to the model in the user

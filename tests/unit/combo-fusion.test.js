@@ -185,6 +185,32 @@ describe("Fusion controller", () => {
     expect(fn).toHaveBeenCalledTimes(5);
   });
 
+  it("preserves Claude tool failure status, IDs and content through every history-bearing stage", async () => {
+    const seen = [];
+    const body = { messages: [
+      { role: "user", content: "Inspect the tool results" },
+      { role: "assistant", content: [
+        { type: "tool_use", id: "ok_call", name: "read_file", input: {} },
+        { type: "tool_use", id: "failed_call", name: "read_file", input: {} },
+      ] },
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "ok_call", content: "Successful read", is_error: false },
+        { type: "tool_result", tool_use_id: "failed_call", content: "Permission denied", is_error: true },
+      ] },
+    ] };
+    const result = await run(successful(seen), { sourceFormat: "claude", body });
+    expect(result.ok).toBe(true);
+    for (const { body: request, execution } of seen) {
+      if (execution.stage === "analyst") continue;
+      const results = request.messages.filter((message) => message.role === "tool");
+      expect(results).toEqual([
+        { role: "tool", tool_call_id: "ok_call", content: "Successful read" },
+        { role: "tool", tool_call_id: "failed_call", content: "[Tool execution failed (is_error=true)]\nPermission denied" },
+      ]);
+    }
+    expect(body.messages[2].content[1].content).toBe("Permission denied");
+  });
+
   it("never mutates the original or shares panel request graphs", async () => {
     const original = structuredClone(base);
     const bodies = [];
