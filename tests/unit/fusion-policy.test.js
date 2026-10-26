@@ -124,7 +124,7 @@ describe("fusion analysis", () => {
     const value = analysis();
     expect(validateFusionAnalysis(value, ["response_1", "response_2"])).toBe(value);
     expect(validateFusionAnalysis(emptyAnalysis(), [])).toEqual(emptyAnalysis());
-    value.partial_coverage[0].response_ids = [];
+    value.partial_coverage = [];
     expect(validateFusionAnalysis(value, ["response_1", "response_2"])).toBe(value);
   });
 
@@ -142,6 +142,8 @@ describe("fusion analysis", () => {
     (v) => { v.contradictions[0].stances[0].stance = ""; },
     (v) => { v.contradictions[0].stances[0].extra = true; },
     (v) => { v.partial_coverage[0].point = ""; },
+    (v) => { v.partial_coverage[0].response_ids = []; },
+    (v) => { v.contradictions[0].stances[1].response_id = v.contradictions[0].stances[0].response_id; },
     (v) => { v.partial_coverage[0].extra = true; },
     (v) => { v.partial_coverage[0].response_ids = ["response_1", "response_1"]; },
     (v) => { v.unique_insights[0].insight = false; },

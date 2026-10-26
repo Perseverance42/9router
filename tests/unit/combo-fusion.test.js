@@ -1,216 +1,156 @@
 import { describe, it, expect, vi } from "vitest";
-
 import { handleFusionChat } from "../../open-sse/services/combo.js";
 
-const log = { info: () => {}, warn: () => {}, debug: () => {} };
+const log = { info() {}, warn() {} };
+const analysis = {
+  consensus: [], contradictions: [], partial_coverage: [], unique_insights: [],
+  blind_spots: [], verification_needed: [], usable_response_ids: ["response_1"],
+};
+const response = (message, finish = "stop") => new Response(JSON.stringify({
+  id: "chatcmpl-test", model: "test", object: "chat.completion", created: 1,
+  choices: [{ index: 0, message: { role: "assistant", ...message }, finish_reason: finish }],
+}));
+const consult = (ids = ["panel_1", "panel_2"]) => response({ tool_calls: [{
+  id: "internal", type: "function", function: { name: "consult_panel", arguments: JSON.stringify({ panel_ids: ids, brief: "Diagnose the observed failure before editing." }) },
+}] }, "tool_calls");
+const base = { messages: [{ role: "user", content: "Diagnose this" }], tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }] };
+const run = (handleSingleModel, extra = {}) => handleFusionChat({ body: structuredClone(base), models: ["p/a", "p/b"], judgeModel: "p/judge", handleSingleModel, log, ...extra });
 
-// Minimal OpenAI-chat Response stub with the .ok + .clone().json() surface the engine uses.
-function okResponse(content, { delayMs = 0 } = {}) {
-  const json = { choices: [{ message: { role: "assistant", content } }] };
-  const make = () => ({ ok: true, status: 200, clone: make, json: async () => json });
-  const res = make();
-  return delayMs > 0 ? new Promise((r) => setTimeout(() => r(res), delayMs)) : res;
+function successful(seen = []) {
+  return vi.fn(async (body, model, execution) => {
+    seen.push({ body, model, execution });
+    if (execution.stage === "initial") return consult();
+    if (execution.stage === "panel") return response({ content: `Advice ${model}` });
+    if (execution.stage === "analyst") return response({ content: JSON.stringify(analysis) });
+    return response({ content: "FINAL" });
+  });
 }
 
-function errResponse(status = 500) {
-  const make = () => ({ ok: false, status, clone: make, json: async () => ({ error: { message: "boom" } }) });
-  return make();
-}
-
-describe("fusion combo", () => {
-  it("answers directly with a single-model panel (nothing to fuse)", async () => {
-    const handleSingleModel = vi.fn(async () => okResponse("solo"));
-    await handleFusionChat({
-      body: { messages: [{ role: "user", content: "hi" }] },
-      models: ["p/only"],
-      handleSingleModel,
-      log,
-    });
-    expect(handleSingleModel).toHaveBeenCalledTimes(1);
-    expect(handleSingleModel.mock.calls[0][1]).toBe("p/only");
-  });
-
-  it("fans out to the panel then routes a synthesis turn to the judge", async () => {
+describe("Fusion controller", () => {
+  it("runs initial, parallel panel, analyst and native synthesis with isolated stage constraints", async () => {
     const seen = [];
-    const handleSingleModel = vi.fn(async (body, model, isPanel) => {
-      seen.push(model);
-      if (model === "p/judge") return okResponse("FINAL");
-      return okResponse(`ans-${model}`);
-    });
-
-    const res = await handleFusionChat({
-      body: { messages: [{ role: "user", content: "Q" }], stream: true, tools: [{ name: "x" }] },
-      models: ["p/a", "p/b", "p/c"],
-      handleSingleModel,
-      log,
-      judgeModel: "p/judge",
-    });
-
-    // 3 panel calls + 1 judge call.
-    expect(handleSingleModel).toHaveBeenCalledTimes(4);
-    expect(seen.slice(0, 3).sort()).toEqual(["p/a", "p/b", "p/c"]);
-    expect(seen[3]).toBe("p/judge");
-
-    // Panel calls are non-streaming with tools stripped.
-    for (const [body, model, isPanel] of handleSingleModel.mock.calls.filter(([, m]) => m !== "p/judge")) {
-      expect(body.stream).toBe(false);
-      expect(body.tools).toBeUndefined();
-      expect(isPanel).toBe(true);
+    const fn = successful(seen);
+    const result = await run(fn, { body: { ...structuredClone(base), stream: true, stream_options: { include_usage: true }, tool_choice: "required" } });
+    expect(result.ok).toBe(true);
+    expect(fn).toHaveBeenCalledTimes(5);
+    expect(seen.map((x) => x.execution.stage)).toEqual(["initial", "panel", "panel", "analyst", "synthesis"]);
+    expect(seen[0].body.tool_choice.function.name).toBe("consult_panel");
+    expect(seen[0].body.stream).toBe(false);
+    for (const entry of seen.slice(1, 3)) {
+      expect(entry.body.tools).toEqual(base.tools);
+      expect(entry.body.stream_options).toBeUndefined();
+      expect(entry.body.tool_choice).toBe("required");
     }
-
-    // Judge call carries every panel answer + keeps the client's stream flag.
-    const [judgeBody, , isPanel] = handleSingleModel.mock.calls.find(([, m]) => m === "p/judge");
-    const judgeText = judgeBody.messages.at(-1).content;
-    expect(judgeText).toContain("ans-p/a");
-    expect(judgeText).toContain("ans-p/b");
-    expect(judgeText).toContain("ans-p/c");
-    expect(judgeText).toContain("Source 1");
-    expect(judgeBody.stream).toBe(true);
-    expect(isPanel).toBeUndefined();
-
-    expect(res.ok).toBe(true);
+    expect(seen[3].body.tools).toBeUndefined();
+    expect(seen[3].body.messages).toHaveLength(2);
+    expect(JSON.stringify(seen[3].body)).not.toContain('"model":"p/a"');
+    expect(seen[4].body.stream).toBe(true);
+    expect(seen[4].body.tool_choice).toBe("required");
+    expect(seen[4].body.messages.some((m) => m.content === "Diagnose this")).toBe(true);
   });
 
-  it("defaults the judge to the first panel model when none is set", async () => {
-    const seen = [];
-    const handleSingleModel = vi.fn(async (_body, model) => { seen.push(model); return okResponse(`ans-${model}`); });
-    await handleFusionChat({
-      body: { messages: [{ role: "user", content: "Q" }] },
-      models: ["p/first", "p/second"],
-      handleSingleModel,
-      log,
-    });
-    // Last call is the judge; defaults to panel[0].
-    expect(seen.at(-1)).toBe("p/first");
+  it("permits a completed direct answer only when minimum is zero", async () => {
+    const fn = vi.fn(async () => response({ content: "Direct" }));
+    expect((await run(fn)).status).toBe(502);
+    fn.mockClear();
+    const res = await run(fn, { tuning: { minPanels: 0, maxPanels: 2 } });
+    expect((await res.json()).choices[0].message.content).toBe("Direct");
+    expect(fn).toHaveBeenCalledTimes(1);
   });
 
-  it("proceeds on quorum without waiting for a straggler (grace window)", async () => {
-    const handleSingleModel = vi.fn(async (_body, model) => {
-      if (model === "p/slow") return okResponse("slow", { delayMs: 5000 });
-      if (model === "p/judge") return okResponse("FINAL");
-      return okResponse(`fast-${model}`);
+  it("dispatches a selected subset once and never starts a panel sequentially", async () => {
+    let release;
+    const barrier = new Promise((r) => { release = r; });
+    let started = 0;
+    const fn = successful();
+    fn.mockImplementation(async (_body, _model, { stage }) => {
+      if (stage === "initial") return consult();
+      if (stage === "panel") { if (++started === 2) release(); await barrier; return response({ content: "ok" }); }
+      if (stage === "analyst") return response({ content: JSON.stringify(analysis) });
+      return response({ content: "done" });
     });
-
-    const t0 = Date.now();
-    await handleFusionChat({
-      body: { messages: [{ role: "user", content: "Q" }] },
-      models: ["p/x", "p/y", "p/slow"],
-      handleSingleModel,
-      log,
-      judgeModel: "p/judge",
-      tuning: { minPanel: 2, stragglerGraceMs: 50, panelHardTimeoutMs: 10000 },
-    });
-    const elapsed = Date.now() - t0;
-
-    // Two fast answers reach quorum; grace is 50ms, so we never wait ~5s for p/slow.
-    expect(elapsed).toBeLessThan(2000);
-
-    const judgeCall = handleSingleModel.mock.calls.find(([, m]) => m === "p/judge");
-    const judgeText = judgeCall[0].messages.at(-1).content;
-    expect(judgeText).toContain("fast-p/x");
-    expect(judgeText).toContain("fast-p/y");
-    expect(judgeText).not.toContain("slow");
+    expect((await run(fn)).ok).toBe(true);
+    expect(started).toBe(2);
   });
 
-  it("returns the lone survivor directly when only one panel model succeeds", async () => {
-    const handleSingleModel = vi.fn(async (_body, model) => {
-      if (model === "p/ok") return okResponse("lone");
-      return errResponse(500);
-    });
-    await handleFusionChat({
-      body: { messages: [{ role: "user", content: "Q" }] },
-      models: ["p/ok", "p/bad"],
-      handleSingleModel,
-      log,
-      judgeModel: "p/judge",
-      tuning: { minPanel: 2, stragglerGraceMs: 50, panelHardTimeoutMs: 5000 },
-    });
-    // No judge call — single answer means there is nothing to fuse.
-    const judged = handleSingleModel.mock.calls.some(([, m]) => m === "p/judge");
-    expect(judged).toBe(false);
-  });
-
-  it("returns 503 when the whole panel fails", async () => {
-    const handleSingleModel = vi.fn(async () => errResponse(500));
-    const res = await handleFusionChat({
-      body: { messages: [{ role: "user", content: "Q" }] },
-      models: ["p/a", "p/b"],
-      handleSingleModel,
-      log,
-      tuning: { minPanel: 2, stragglerGraceMs: 50, panelHardTimeoutMs: 5000 },
-    });
-    expect(res.status).toBe(503);
-  });
-
-  it("flattens previous tool history and assistant tool_calls into prose for panel calls", async () => {
-    const handleSingleModel = vi.fn(async () => okResponse("ans"));
-    await handleFusionChat({
-      body: {
-        messages: [
-          { role: "user", content: "find files" },
-          { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "find" } }] },
-          { role: "tool", tool_call_id: "c1", content: "['a.js']" },
-          { role: "user", content: "describe it" }
-        ],
-        tools: [{ type: "function" }]
-      },
-      models: ["p/a", "p/b"],
-      handleSingleModel,
-      log,
-      judgeModel: "p/judge"
-    });
-
-    // Panel calls keep every turn but tool turns are flattened to assistant prose.
-    const panelCalls = handleSingleModel.mock.calls.filter(([,, isPanel]) => isPanel === true);
-    expect(panelCalls.length).toBe(2);
-    for (const [panelBody] of panelCalls) {
-      expect(panelBody.tools).toBeUndefined();
-      expect(panelBody.messages.length).toBe(4);
-      expect(panelBody.messages[0]).toEqual({ role: "user", content: "find files" });
-      expect(panelBody.messages[1].tool_calls).toBeUndefined();
-      expect(panelBody.messages[1].content).toContain("find");
-      expect(panelBody.messages[2].role).toBe("assistant");
-      expect(panelBody.messages[2].content).toContain("['a.js']");
-      expect(panelBody.messages[3]).toEqual({ role: "user", content: "describe it" });
+  it("rejects invalid selections without calling any panel", async () => {
+    for (const ids of [["panel_1"], ["panel_1", "panel_1"], ["panel_1", "unknown"]]) {
+      const fn = vi.fn(async () => consult(ids));
+      expect((await run(fn)).status).toBe(502);
+      expect(fn).toHaveBeenCalledTimes(1);
     }
-
-    // Judge call still receives the unmodified history + synthesis prompt.
-    const judgeCall = handleSingleModel.mock.calls.find(([, m]) => m === "p/judge");
-    expect(judgeCall).toBeDefined();
-    const judgeBody = judgeCall[0];
-    expect(judgeBody.messages.length).toBe(5); // original 4 + judge prompt turn
-    expect(judgeBody.messages[1].tool_calls).toBeDefined();
-    expect(judgeBody.messages[2].role).toBe("tool");
   });
 
-  it("flattens Anthropic-style tool_use and tool_result blocks in arrays", async () => {
-    const handleSingleModel = vi.fn(async () => okResponse("ans"));
-    await handleFusionChat({
-      body: {
-        messages: [
-          { role: "user", content: "do it" },
-          { role: "assistant", content: [{ type: "text", text: "ok" }, { type: "tool_use", id: "t1", name: "run" }] },
-          { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "done" }] }
-        ],
-        tools: [{ name: "run", description: "d" }]
-      },
-      models: ["p/a", "p/b"],
-      handleSingleModel,
-      log,
-      judgeModel: "p/judge"
+  it("aborts siblings on the primary technical error without waiting for ignored cancellation", async () => {
+    let siblingSignal;
+    const fn = vi.fn(async (_b, model, { stage, signal }) => {
+      if (stage === "initial") return consult();
+      if (model === "p/a") return new Response(JSON.stringify({ error: { message: "provider exploded" } }), { status: 503 });
+      siblingSignal = signal;
+      return new Promise(() => {});
     });
+    const result = await run(fn);
+    expect(result.status).toBe(502);
+    expect(siblingSignal.aborted).toBe(true);
+    expect((await result.json()).error.message).toBe("provider exploded");
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
 
-    const panelCalls = handleSingleModel.mock.calls.filter(([,, isPanel]) => isPanel === true);
-    expect(panelCalls.length).toBe(2);
-    const panelBody = panelCalls[0][0];
-    
-    expect(panelBody.tools).toBeUndefined();
-    expect(panelBody.messages.length).toBe(3);
-    
-    // Flattened tool_use
-    expect(panelBody.messages[1].content).toBe("ok\n[Called tools: run]");
-    
-    // Flattened tool_result
-    expect(panelBody.messages[2].content).toBe("[Tool result: done]");
+  it("client cancellation stops all work before analysis", async () => {
+    const parent = new AbortController();
+    let release;
+    const started = new Promise((r) => { release = r; });
+    const fn = vi.fn(async (_b, _m, { stage }) => {
+      if (stage === "initial") return consult();
+      release();
+      return new Promise(() => {});
+    });
+    const pending = run(fn, { signal: parent.signal });
+    await started;
+    parent.abort();
+    expect((await pending).status).toBe(499);
+    expect(fn.mock.calls.every(([, , e]) => e.signal.aborted)).toBe(true);
+  });
+
+  it("passes tool-only, malformed candidate arguments and exposed reasoning to evaluation", async () => {
+    let data;
+    const fn = vi.fn(async (_b, _m, { stage }) => {
+      if (stage === "initial") return consult();
+      if (stage === "panel") return response({ reasoning_content: "Visible summary", tool_calls: [{ function: { name: "read_file", arguments: "{broken" } }] }, "tool_calls");
+      if (stage === "analyst") { data = _b.messages[1].content; return response({ content: JSON.stringify(analysis) }); }
+      return response({ content: "Cannot diagnose yet" });
+    });
+    expect((await run(fn)).ok).toBe(true);
+    expect(data).toContain("Visible summary");
+    expect(data).toContain("Invalid JSON arguments");
+    expect(data).not.toContain("p/a");
+  });
+
+  it("invalid analysis stops synthesis rather than stripping fences or repairing JSON", async () => {
+    const fn = successful();
+    fn.mockImplementation(async (_b, _m, { stage }) => {
+      if (stage === "initial") return consult();
+      if (stage === "panel") return response({ content: "advice" });
+      return response({ content: "```json\n{}\n```" });
+    });
+    const res = await run(fn);
+    expect(res.status).toBe(502);
+    expect(fn).toHaveBeenCalledTimes(4);
+  });
+
+  it("never mutates the original or shares panel request graphs", async () => {
+    const original = structuredClone(base);
+    const bodies = [];
+    const fn = successful();
+    fn.mockImplementation(async (b, _m, { stage }) => {
+      if (stage === "initial") return consult();
+      if (stage === "panel") { bodies.push(b); b.messages[0].content = "changed"; return response({ content: "advice" }); }
+      if (stage === "analyst") return response({ content: JSON.stringify(analysis) });
+      expect(b.messages.find((m) => m.role === "user").content).toBe("Diagnose this");
+      return response({ content: "done" });
+    });
+    await run(fn, { body: original });
+    expect(original).toEqual(base);
+    expect(bodies[0].messages).not.toBe(bodies[1].messages);
   });
 });

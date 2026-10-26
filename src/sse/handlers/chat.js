@@ -21,6 +21,7 @@ import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActi
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
+import { getCapabilitiesForModel } from "open-sse/providers/capabilities.js";
 import { resolveSessionIdentity } from "open-sse/utils/sessionManager.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
@@ -121,14 +122,7 @@ export async function handleChat(request, clientRawRequest = null) {
       return handleFusionChat({
         body,
         models: comboModels,
-        handleSingleModel: (b, m, isPanel) => {
-          let cleanRawReq = clientRawRequest;
-          if (isPanel && clientRawRequest) {
-            const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
-            cleanRawReq = { ...clientRawRequest, body: cleanBody };
-          }
-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
-        },
+        ...fusionExecutionContext(body, clientRawRequest, request, apiKey),
         log,
         comboName: modelStr,
         judgeModel: comboStrategies[modelStr]?.judgeModel,
@@ -187,16 +181,40 @@ export async function handleChat(request, clientRawRequest = null) {
   return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null);
 }
 
+function fusionExecutionContext(body, clientRawRequest, request, apiKey) {
+  return {
+    signal: request?.signal,
+    sourceFormat: request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) || undefined : undefined,
+    preflight: async (models, canonical) => {
+      const required = detectRequiredCapabilities(canonical);
+      for (const target of models) {
+        const info = await getModelInfo(target);
+        if (!info.provider) throw new Error(`Nested combo is not supported in Fusion: ${target}`);
+        const caps = getCapabilitiesForModel(info.provider, info.model);
+        for (const capability of ["vision", "pdf", "audioInput", "videoInput"]) {
+          if (required.has(capability) && !caps[capability]) throw new Error(`Fusion target ${target} lacks ${capability}`);
+        }
+      }
+    },
+    handleSingleModel: (b, m, execution) => handleSingleModelChat(
+      b, m, { endpoint: clientRawRequest?.endpoint, headers: { ...clientRawRequest?.headers }, body: structuredClone(b) },
+      request, apiKey, null, execution,
+    ),
+  };
+}
+
 /**
  * Handle single model chat request
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, execution = {}) {
+  if (execution.signal?.aborted) return errorResponse(499, "Request aborted");
   const modelInfo = await getModelInfo(modelStr);
 
   // If provider is null, this might be a combo name - check and handle
   if (!modelInfo.provider) {
     const comboModels = await getComboModels(modelStr);
     if (comboModels) {
+      if (execution.internal) return errorResponse(400, "Nested combos are not supported in Fusion stages");
       const chatSettings = await getSettings();
       // Check for combo-specific strategy first, fallback to global
       const comboStrategies = chatSettings.comboStrategies || {};
@@ -214,14 +232,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         return handleFusionChat({
           body,
           models: comboModels,
-          handleSingleModel: (b, m, isPanel) => {
-            let cleanRawReq = clientRawRequest;
-            if (isPanel && clientRawRequest) {
-              const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
-              cleanRawReq = { ...clientRawRequest, body: cleanBody };
-            }
-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
-          },
+          ...fusionExecutionContext(body, clientRawRequest, request, apiKey),
           log,
           comboName: modelStr,
           judgeModel: comboStrategies[modelStr]?.judgeModel,
@@ -277,6 +288,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   let lastHeaders = null;
 
   while (true) {
+    if (execution.signal?.aborted) return errorResponse(499, "Request aborted");
     const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { requestedModel: requestedModel || model });
 
     // All accounts unavailable
@@ -310,8 +322,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Use shared chatCore
     const chatSettings = await getSettings();
-    const providerThinking = (chatSettings.providerThinking || {})[provider] || null;
+    const providerThinking = execution.internal ? null : (chatSettings.providerThinking || {})[provider] || null;
+    if (execution.signal?.aborted) return errorResponse(499, "Request aborted");
     const result = await handleChatCore({
+      externalSignal: execution.signal,
+      internal: execution.internal === true,
+      responseFormatOverride: execution.outputFormat,
       body: { ...body, model: `${provider}/${model}` },
       modelInfo: { provider, model },
       credentials: refreshedCredentials,
@@ -320,19 +336,19 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       connectionId: credentials.connectionId,
       userAgent,
       apiKey,
-      ccFilterNaming: !!chatSettings.ccFilterNaming,
-      rtkEnabled: !!chatSettings.rtkEnabled,
-      headroomEnabled: !!chatSettings.headroomEnabled,
+      ccFilterNaming: !execution.internal && !!chatSettings.ccFilterNaming,
+      rtkEnabled: !execution.internal && !!chatSettings.rtkEnabled,
+      headroomEnabled: !execution.internal && !!chatSettings.headroomEnabled,
       headroomUrl: chatSettings.headroomUrl || DEFAULT_HEADROOM_URL,
       headroomCompressUserMessages: !!chatSettings.headroomCompressUserMessages,
       headroomTimeoutMs: chatSettings.headroomTimeoutMs,
-      cavemanEnabled: !!chatSettings.cavemanEnabled,
+      cavemanEnabled: !execution.internal && !!chatSettings.cavemanEnabled,
       cavemanLevel: chatSettings.cavemanLevel || "full",
-      ponytailEnabled: !!chatSettings.ponytailEnabled,
+      ponytailEnabled: !execution.internal && !!chatSettings.ponytailEnabled,
       ponytailLevel: chatSettings.ponytailLevel || "full",
-      customPromptEnabled: !!chatSettings.customPromptEnabled,
+      customPromptEnabled: !execution.internal && !!chatSettings.customPromptEnabled,
       customPrompt: chatSettings.customPrompt || "",
-      pxpipeEnabled: !!chatSettings.pxpipeEnabled,
+      pxpipeEnabled: !execution.internal && !!chatSettings.pxpipeEnabled,
       pxpipeMinChars: chatSettings.pxpipeMinChars,
       pxpipeTimeoutMs: chatSettings.pxpipeTimeoutMs,
       // Lazily warms the in-process module on first use; null when not installed (fail-open)
@@ -342,7 +358,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       // Per-provider user overrides (custom headers / connect timeout) from settings
       providerOverrides: (chatSettings.providerOverrides || {})[provider] || null,
       // Detect source format by endpoint + body
-      sourceFormatOverride: request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null,
+      sourceFormatOverride: execution.sourceFormat || (request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null),
       onCredentialsRefreshed: async (newCreds) => {
         await updateProviderCredentials(credentials.connectionId, {
           ...newCreds,
@@ -357,6 +373,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       }
     });
 
+    if (execution.signal?.aborted) return errorResponse(499, "Request aborted");
     if (result.success) return result.response;
 
     // Antigravity 409/429: refresh live quota to get exact resetAt before locking
