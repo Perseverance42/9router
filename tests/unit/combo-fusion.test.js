@@ -92,7 +92,7 @@ describe("Fusion controller", () => {
     const result = await run(fn);
     expect(result.status).toBe(502);
     expect(siblingSignal.aborted).toBe(true);
-    expect((await result.json()).error.message).toBe("provider exploded");
+    expect((await result.json()).error).toMatchObject({ message: "provider exploded", details: { model: "p/a", slot: "panel_1", upstream_status: 503 } });
     expect(fn).toHaveBeenCalledTimes(3);
   });
 
@@ -136,6 +136,53 @@ describe("Fusion controller", () => {
     const res = await run(fn);
     expect(res.status).toBe(502);
     expect(fn).toHaveBeenCalledTimes(4);
+  });
+
+  it("supports explicit judges without panel slots and rejects missing judges before dispatch", async () => {
+    const fn = vi.fn(async () => response({ content: "Direct" }));
+    expect((await run(fn, { models: [], judgeModel: "p/judge" })).ok).toBe(true);
+    fn.mockClear();
+    expect((await run(fn, { models: [], judgeModel: undefined })).status).toBe(400);
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it("rejects Claude evidence and server tools that cannot survive canonicalization", async () => {
+    for (const patch of [
+      { tools: [{ type: "web_search_20250305", name: "web_search" }] },
+      { messages: [{ role: "user", content: [{ type: "image", source: { type: "url", url: "https://example.test/image" } }] }] },
+      { messages: [{ role: "user", content: [{ type: "document", source: { type: "base64", data: "data" } }] }] },
+    ]) {
+      const fn = successful();
+      expect((await run(fn, { sourceFormat: "claude", body: { messages: [{ role: "user", content: "Question" }], ...patch } })).status).toBe(400);
+      expect(fn).not.toHaveBeenCalled();
+    }
+  });
+
+  it("preserves all instruction messages and shares anonymous ordering across judging", async () => {
+    const seen = [];
+    const result = await run(successful(seen), { body: { ...base, messages: [
+      { role: "system", content: "First rule" }, { role: "developer", content: "Second rule" }, ...base.messages,
+    ] } });
+    expect(result.ok).toBe(true);
+    for (const entry of seen.filter(({ execution }) => execution.stage !== "analyst")) {
+      expect(JSON.stringify(entry.body.messages)).toContain("First rule");
+      expect(JSON.stringify(entry.body.messages)).toContain("Second rule");
+    }
+    const advisory = (entry) => JSON.parse(entry.body.messages.at(-1).content.split("\n").slice(1).join("\n"));
+    expect(advisory(seen[3]).responses).toEqual(advisory(seen[4]).responses);
+  });
+
+  it("returns a stable no-action error for impossible streamed JSON constraints without retry", async () => {
+    const fn = vi.fn(async (_body, _model, { stage }) => {
+      if (stage === "initial") return consult();
+      if (stage === "panel") return response({ content: "Unusable" });
+      if (stage === "analyst") return response({ content: JSON.stringify({ ...analysis, usable_response_ids: [] }) });
+      return response({ content: "Cannot answer" });
+    });
+    const result = await run(fn, { body: { ...base, stream: true, response_format: { type: "json_object" } } });
+    expect(result.status).toBe(502);
+    expect((await result.json()).error).toMatchObject({ code: "fusion_no_usable_action", details: { retryable: false } });
+    expect(fn).toHaveBeenCalledTimes(5);
   });
 
   it("never mutates the original or shares panel request graphs", async () => {

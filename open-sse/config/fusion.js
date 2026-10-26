@@ -90,8 +90,8 @@ function array(value, path) {
 }
 
 export function resolveFusionPolicy(models, tuning = {}) {
-  if (!Array.isArray(models) || models.length === 0) {
-    throw new Error("Fusion requires a nonempty model list");
+  if (!Array.isArray(models)) {
+    throw new Error("Fusion requires a model list");
   }
   const slots = Array.from(models, (model, index) => {
     nonemptyString(model, `models[${index}]`);

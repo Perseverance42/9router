@@ -56,12 +56,13 @@ describe("fusion policy", () => {
     expect(optional.instructions).toContain("without panel consultation is permitted");
     const direct = resolveFusionPolicy(models, { minPanels: 0, maxPanels: 0 });
     expect(direct.slots).toHaveLength(3);
+    expect(resolveFusionPolicy([])).toMatchObject({ slots: [], minPanels: 0, maxPanels: 0 });
     expect(direct.instructions).toContain("Do not invoke consult_panel");
     expect(() => validateFusionSelection({ panel_ids: [], brief: "help" }, direct)).toThrow();
     expect(() => validateFusionSelection({ panel_ids: ["panel_1"], brief: "help" }, direct)).toThrow();
   });
 
-  it.each([undefined, null, [], "p/a", [""], [" "], [null], [false], [0], [{}], ["p/a", undefined], Array(1)].map((value) => [value]))(
+  it.each([undefined, null, "p/a", [""], [" "], [null], [false], [0], [{}], ["p/a", undefined], Array(1)].map((value) => [value]))(
     "rejects invalid models rather than filtering: %j", (value) => {
       expect(() => resolveFusionPolicy(value)).toThrow();
     },

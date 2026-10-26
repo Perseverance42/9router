@@ -1,9 +1,11 @@
 import { randomInt } from "node:crypto";
 import { FORMATS } from "../translator/formats.js";
 import { ROLE } from "../translator/schema/index.js";
+import { extractReasoningText } from "../translator/concerns/reasoning.js";
 import { translateRequest } from "../translator/index.js";
 import { detectFormat } from "./provider.js";
 import { deliverFusionCompletion } from "./fusionOutput.js";
+import { guardFusionStream } from "./fusionStream.js";
 import {
   FUSION_TOOL_NAME, FUSION_ANALYST_SCHEMA, FUSION_ANALYST_MAX_TOKENS,
   FUSION_ANALYST_INSTRUCTIONS, FUSION_SYNTHESIS_INSTRUCTIONS, FUSION_CONSULT_PARAMETERS,
@@ -51,6 +53,21 @@ function canonicalRequest(body, sourceFormat) {
   if (body.previous_response_id) throw new FusionError("Fusion requires explicit conversation history", "preflight", {}, 400);
   if (sourceFormat === FORMATS.OPENAI_RESPONSES && body.tools?.some((tool) => tool.type !== "function")) {
     throw new FusionError("Fusion does not support Responses hosted/custom tools yet", "preflight", {}, 400);
+  }
+  if (sourceFormat === FORMATS.CLAUDE) {
+    if (body.tools?.some((tool) => tool.type && tool.type !== "custom")) {
+      throw new FusionError("Fusion supports Claude custom function tools only", "preflight", {}, 400);
+    }
+    const checkBlocks = (blocks) => {
+      if (!Array.isArray(blocks)) return;
+      for (const block of blocks) {
+        if (block.type === "document" || (block.type === "image" && block.source?.type !== "base64")) {
+          throw new FusionError("Fusion cannot preserve this Claude media block", "preflight", {}, 400);
+        }
+        if (block.type === "tool_result") checkBlocks(block.content);
+      }
+    };
+    for (const message of body.messages || []) checkBlocks(message.content);
   }
   const copy = structuredClone(body);
   const canonical = translateRequest(sourceFormat, FORMATS.OPENAI, body.model, copy, false);
@@ -115,7 +132,7 @@ function candidate(completion, tools, constraints = {}, validators = new Map()) 
   return {
     content: message.content ?? null,
     tool_calls: calls,
-    reasoning: message.reasoning_content || message.reasoning || null,
+    reasoning: extractReasoningText(message) || null,
     refusal: message.refusal || null,
     finish_reason: choice.finish_reason || null,
     issues,
@@ -171,6 +188,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
     checkAbort();
     const policy = resolveFusionPolicy(models, tuning);
     const judge = judgeModel?.trim() || models[0];
+    if (!judge) throw new FusionError("Fusion requires an explicit judge when no panels are configured", stage, {}, 400);
     if (![FORMATS.OPENAI, FORMATS.CLAUDE, FORMATS.OPENAI_RESPONSES].includes(sourceFormat)) {
       throw new FusionError(`Unsupported Fusion client format: ${sourceFormat}`, stage, {}, 400);
     }
@@ -188,6 +206,9 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
       if (!message.tool_calls?.length && ["json_schema", "json_object"].includes(answerFormat?.type)) {
         let value;
         try { value = JSON.parse(message.content); } catch { throw new FusionError("Judge answer violates requested JSON output", stage); }
+        if (answerFormat.type === "json_object" && (!value || typeof value !== "object" || Array.isArray(value))) {
+          throw new FusionError("Judge answer must be a JSON object", stage);
+        }
         if (answerValidator && !answerValidator(value)) throw new FusionError("Judge answer violates requested output schema", stage);
       }
     };
@@ -233,12 +254,16 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
     const pending = selected.map(async (slot) => {
       try {
         const request = structuredClone(base);
+        addInstruction(request, "Panel responses are advisory; propose application actions without executing them.");
         request.messages.push(advisory({ consultation_brief: args.brief }));
         const completion = await complete(request, slot.model, "panel");
         return candidate(completion, publicTools, original, validators);
       } catch (error) {
-        if (!controller.signal.aborted) controller.abort(error);
-        throw error;
+        if (controller.signal.aborted) throw error;
+        const failure = error instanceof FusionError ? error : new FusionError(error.message || "Invalid panel completion", "panel");
+        failure.details = { ...failure.details, model: slot.model, slot: slot.id };
+        if (!controller.signal.aborted) controller.abort(failure);
+        throw failure;
       }
     });
     const settled = await Promise.allSettled(pending);
@@ -246,7 +271,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
     if (failed) throw controller.signal.reason || failed.reason;
     checkAbort();
     const responses = anonymize(settled.map((result) => result.value));
-    const context = { brief: args.brief, responses };
+    const context = { brief: args.brief, participation: { minPanels: policy.minPanels, maxPanels: policy.maxPanels, selectedPanels: selected.length }, responses };
     stage = "analyst";
     const analysisRequest = {
       messages: [instruction(FUSION_ANALYST_INSTRUCTIONS), advisory(context)],
@@ -269,7 +294,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
     addInstruction(synthesis, FUSION_SYNTHESIS_INSTRUCTIONS);
     synthesis.messages.push(advisory({ ...context, analysis }));
     const requiresAction = original.tool_choice === "required" || typeof original.tool_choice === "object";
-    if (!synthesis.stream || (!analysis.usable_response_ids.length && requiresAction)) {
+    if (!synthesis.stream || (!analysis.usable_response_ids.length && (requiresAction || answerFormat))) {
       const completion = await complete(synthesis, judge, stage);
       try {
         validatePublicAction(completion, original, validators, stage);
@@ -283,20 +308,15 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
       return deliverFusionCompletion(completion, { sourceFormat, stream: body.stream === true, includeUsage: body.stream_options?.include_usage === true });
     }
     const response = await invoke(synthesis, judge, stage, sourceFormat);
-    // Detach parent listeners on EOF/cancel without buffering native synthesis.
-    const reader = response.body.getReader();
     handedOff = true;
-    const detach = () => signal?.removeEventListener("abort", onAbort);
-    return new Response(new ReadableStream({
-      async pull(output) {
-        try {
-          const { done, value } = await reader.read();
-          if (done) { detach(); output.close(); }
-          else output.enqueue(value);
-        } catch (error) { detach(); controller.abort(error); output.error(error); }
-      },
-      cancel(reason) { detach(); controller.abort(reason); return reader.cancel(reason); },
-    }), { status: response.status, headers: response.headers });
+    // ponytail: streamed text/schema correctness is provider-enforced; buffer the
+    // final completion when full precommit answer validation becomes necessary.
+    return guardFusionStream(response, {
+      sourceFormat, signal: controller.signal,
+      validate: (completion) => validatePublicAction(completion, original, validators, stage),
+      abort: (reason) => controller.abort(reason),
+      detach: () => signal?.removeEventListener("abort", onAbort),
+    });
   } catch (error) {
     const clientAborted = signal?.aborted;
     if (!controller.signal.aborted) controller.abort(error);
