@@ -186,7 +186,7 @@ export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
  * Handle case: provider forced streaming but client wants JSON.
  * Supports both Codex/Responses API SSE and standard Chat Completions SSE.
  */
-export async function handleForcedSSEToJson({ providerResponse, sourceFormat, targetFormat, provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, customToolNames, toolNameMap, trackDone, appendLog, reqTag, log }) {
+export async function handleForcedSSEToJson({ providerResponse, sourceFormat, targetFormat, provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, customToolNames, toolNameMap, trackDone, appendLog, reqTag, log, internal = false }) {
   const contentType = providerResponse.headers.get("content-type") || "";
   const isSSE = contentType.includes("text/event-stream") || (contentType === "" && isResponsesProvider(provider));
   if (!isSSE) return null; // not handled here
@@ -276,6 +276,12 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
       } else {
         const message = { role: "assistant", content: textContent || (hasToolCalls ? null : "") };
         if (hasToolCalls) message.tool_calls = toolCalls;
+        if (internal) {
+          const reasoning = (jsonResponse.output || [])
+            .filter((item) => item.type === RESPONSES_ITEM.REASONING)
+            .flatMap((item) => item.summary || []).map((part) => part.text || "").join("\n");
+          if (reasoning) message.reasoning_content = reasoning;
+        }
         const responseDone = jsonResponse.status === "completed" || jsonResponse.status === "done";
         const finishReason = hasToolCalls ? "tool_calls" : (responseDone ? "stop" : (jsonResponse.status || "stop"));
         finalResp = {
@@ -352,7 +358,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
     // When content is empty (e.g. thinking models that used all tokens for reasoning),
     // reasoning_content is the only useful output and must be preserved.
     // Previously this was unconditional, which broke Qwen3.5, Claude extended thinking, etc.
-    if (parsed?.choices) {
+    if (!internal && parsed?.choices) {
       for (const choice of parsed.choices) {
         if (choice?.message?.reasoning_content && choice.message.content) {
           delete choice.message.reasoning_content;

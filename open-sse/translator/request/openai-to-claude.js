@@ -114,6 +114,8 @@ export function openaiToClaudeRequest(model, body, stream) {
     }
   }
 
+  if (body.stop !== undefined) result.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop];
+
   // Handle response_format for JSON mode
   if (body.response_format) {
     const responseFormat = body.response_format;

@@ -261,6 +261,11 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     }
   }
 
+  if (internal && targetFormat === FORMATS.CLAUDE && !responseBody?.choices
+    && (responseBody?.type !== "message" || !Object.prototype.hasOwnProperty.call(responseBody, "content"))) {
+    return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid Claude completion envelope");
+  }
+
   // Unwrap before any consumer reads choices/usage so non-stream clients get a
   // bare OpenAI body and usage tracking sees data.usage. No-op unless the
   // provider opts in via transport.quirks.clineEnvelope.
@@ -322,7 +327,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   // Strip reasoning_content only when content is non-empty.
   // When content is empty (e.g. thinking models that used all tokens for reasoning),
   // reasoning_content is the only useful output and must be preserved.
-  if (!isClaudeMessageResponse && !isResponsesResponse && translatedResponse?.choices) {
+  if (!internal && !isClaudeMessageResponse && !isResponsesResponse && translatedResponse?.choices) {
     for (const choice of translatedResponse.choices) {
       if (choice?.message?.reasoning_content && choice.message.content) {
         delete choice.message.reasoning_content;
