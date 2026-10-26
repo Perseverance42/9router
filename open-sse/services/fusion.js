@@ -1,6 +1,6 @@
 import { randomInt } from "node:crypto";
 import { FORMATS } from "../translator/formats.js";
-import { ROLE } from "../translator/schema/index.js";
+import { ROLE, CLAUDE_BLOCK } from "../translator/schema/index.js";
 import { extractReasoningText } from "../translator/concerns/reasoning.js";
 import { translateRequest } from "../translator/index.js";
 import { detectFormat } from "./provider.js";
@@ -9,7 +9,7 @@ import { guardFusionStream } from "./fusionStream.js";
 import {
   FUSION_TOOL_NAME, FUSION_ANALYST_SCHEMA, FUSION_ANALYST_MAX_TOKENS,
   FUSION_ANALYST_INSTRUCTIONS, FUSION_SYNTHESIS_INSTRUCTIONS, FUSION_CONSULT_PARAMETERS,
-  FUSION_ERROR_MESSAGE_LIMIT, resolveFusionPolicy, validateFusionSelection, validateFusionAnalysis,
+  FUSION_ERROR_MESSAGE_LIMIT, FUSION_TOOL_STATUS_INSTRUCTIONS, resolveFusionPolicy, validateFusionSelection, validateFusionAnalysis,
 } from "../config/fusion.js";
 
 class FusionError extends Error {
@@ -69,9 +69,22 @@ function canonicalRequest(body, sourceFormat) {
     };
     for (const message of body.messages || []) checkBlocks(message.content);
   }
+  const toolStatuses = [];
+  if (sourceFormat === FORMATS.CLAUDE) {
+    for (const [messageIndex, message] of (body.messages || []).entries()) {
+      const blocks = Array.isArray(message.content) ? message.content : [message.content];
+      for (const [blockIndex, block] of blocks.entries()) {
+        if (block?.type === CLAUDE_BLOCK.TOOL_RESULT) toolStatuses.push({
+          message_index: messageIndex, block_index: blockIndex,
+          tool_call_id: block.tool_use_id, is_error: block.is_error === true,
+        });
+      }
+    }
+  }
   const copy = structuredClone(body);
   const canonical = translateRequest(sourceFormat, FORMATS.OPENAI, body.model, copy, false);
   if (!canonical || !Array.isArray(canonical.messages)) throw new FusionError("Unsupported Fusion conversation format", "preflight", {}, 400);
+  if (toolStatuses.length) addInstruction(canonical, `${FUSION_TOOL_STATUS_INSTRUCTIONS}\n${JSON.stringify(toolStatuses)}`);
   if (canonical.n !== undefined && canonical.n !== 1) throw new FusionError("Fusion supports one completion per request", "preflight", {}, 400);
   // Responses format constraints are public constraints, not analyst output settings.
   if (body.text?.format && !canonical.response_format) canonical.response_format = structuredClone(body.text.format);
