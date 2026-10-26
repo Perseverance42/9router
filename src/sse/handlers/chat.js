@@ -294,7 +294,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
   while (true) {
     if (execution.signal?.aborted) return errorResponse(499, "Request aborted");
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { requestedModel: requestedModel || model });
+    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { requestedModel: requestedModel || model, signal: execution.signal });
+    if (execution.signal?.aborted) return errorResponse(499, "Request aborted");
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
@@ -313,15 +314,17 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     }
 
     // Account selection shown in the unified "▶" line (acc:...)
-    const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
+    const refreshedCredentials = await checkAndRefreshToken(provider, credentials, { signal: execution.signal });
+    if (execution.signal?.aborted) return errorResponse(499, "Request aborted");
 
     // Ensure real project ID is available for providers that need it (P0 fix: cold miss)
     if ((provider === "antigravity" || provider === "gemini-cli") && !refreshedCredentials.projectId) {
       const pid = await getProjectIdForConnection(credentials.connectionId, refreshedCredentials.accessToken, provider);
+      if (execution.signal?.aborted) return errorResponse(499, "Request aborted");
       if (pid) {
         refreshedCredentials.projectId = pid;
         // Persist to DB in background so subsequent requests have it immediately
-        updateProviderCredentials(credentials.connectionId, { projectId: pid }).catch(() => { });
+        updateProviderCredentials(credentials.connectionId, { projectId: pid }, { signal: execution.signal }).catch(() => { });
       }
     }
 
@@ -364,14 +367,15 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       providerOverrides: (chatSettings.providerOverrides || {})[provider] || null,
       // Detect source format by endpoint + body
       sourceFormatOverride: execution.sourceFormat || (request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null),
-      onCredentialsRefreshed: async (newCreds) => {
+      onCredentialsRefreshed: async (newCreds, options = {}) => {
         await updateProviderCredentials(credentials.connectionId, {
           ...newCreds,
           existingProviderSpecificData: credentials.providerSpecificData,
           testStatus: "active"
-        });
+        }, { signal: options.preserveRotatedToken ? undefined : execution.signal });
       },
       onRequestSuccess: async () => {
+        if (execution.signal?.aborted) return;
         await clearAccountError(credentials.connectionId, credentials, model);
         // "Consecutive" strikes: a success clears the breaker for this pair.
         clearAntigravityStrikes(credentials.connectionId, model);
@@ -392,6 +396,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       if (quotaResetMs) resetsAtMs = quotaResetMs;
     }
 
+    if (execution.signal?.aborted) return errorResponse(499, "Request aborted");
     // Exhausted Antigravity model is blocked only in RAM cache until upstream resetAt.
     // Do not persist a modelLock_* for this path.
     const shouldFallback = provider === "antigravity" && quotaResetMs

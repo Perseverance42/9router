@@ -13,6 +13,7 @@ const fx = vi.hoisted(() => ({
 const mocks = vi.hoisted(() => ({
   getProviderCredentials: vi.fn(),
   handleChatCore: vi.fn(),
+  checkAndRefreshToken: vi.fn(),
 }));
 
 vi.mock("@/lib/localDb", () => ({
@@ -40,7 +41,7 @@ vi.mock("@/sse/services/auth.js", () => ({
   isValidApiKey: async () => true,
 }));
 vi.mock("@/sse/services/tokenRefresh.js", () => ({
-  checkAndRefreshToken: async (_p, c) => c,
+  checkAndRefreshToken: mocks.checkAndRefreshToken,
   updateProviderCredentials: vi.fn(),
 }));
 vi.mock("open-sse/handlers/chatCore.js", () => ({ handleChatCore: mocks.handleChatCore }));
@@ -67,8 +68,8 @@ const CONTENT = (t) => `data: {"id":"x","choices":[{"index":0,"delta":{"content"
 const DONE = `data: [DONE]\n\n`;
 
 const auth = (k) => (k ? { Authorization: `Bearer ${k}` } : {});
-const post = (path, body, k, extra = {}) => new Request(`http://localhost${path}`, {
-  method: "POST",
+const post = (path, body, k, extra = {}, signal) => new Request(`http://localhost${path}`, {
+  method: "POST", signal,
   headers: { "Content-Type": "application/json", ...auth(k), ...extra },
   body: JSON.stringify(body),
 });
@@ -76,6 +77,7 @@ const post = (path, body, k, extra = {}) => new Request(`http://localhost${path}
 beforeEach(() => {
   vi.clearAllMocks();
   fx.settings = {};
+  mocks.checkAndRefreshToken.mockImplementation(async (_p, c) => c);
   fx.keys = {
     "sk-open": { id: "o", name: "open", isActive: true, access: { restricted: false, allow: [] } },
     "sk-combo": { id: "c", name: "combo", isActive: true, access: { restricted: true, allow: ["Main"] } },
@@ -106,6 +108,38 @@ const chat = (model, k) => handleChat(post("/v1/chat/completions", { model, stre
 describe("chat (/v1/chat/completions, /v1/messages, /v1/responses all use handleChat)", () => {
   beforeEach(() => mocks.getProviderCredentials.mockResolvedValue({ connectionId: "conn", connectionName: "mock" }));
 
+  it("stops between credential selection and proactive refresh when Fusion is cancelled", async () => {
+    fx.settings = { comboStrategies: { Main: { fallbackStrategy: "fusion" } } };
+    const parent = new AbortController();
+    mocks.getProviderCredentials.mockImplementationOnce(async () => {
+      parent.abort(new Error("Sibling failed"));
+      return { connectionId: "conn" };
+    });
+    const result = await handleChat(post("/v1/chat/completions", {
+      model: "Main", messages: [{ role: "user", content: "Question" }],
+    }, "sk-combo", {}, parent.signal));
+    expect(result.status).toBe(499);
+    expect(mocks.checkAndRefreshToken).not.toHaveBeenCalled();
+    expect(mocks.handleChatCore).not.toHaveBeenCalled();
+    expect(mocks.getProviderCredentials).toHaveBeenCalledTimes(1);
+    expect(mocks.getProviderCredentials.mock.calls[0][3].signal.aborted).toBe(true);
+  });
+  it("does not dispatch or select another account after proactive refresh cancellation", async () => {
+    fx.settings = { comboStrategies: { Main: { fallbackStrategy: "fusion" } } };
+    const parent = new AbortController();
+    mocks.checkAndRefreshToken.mockImplementationOnce(async (_provider, credentials, { signal }) => {
+      expect(signal.aborted).toBe(false);
+      parent.abort();
+      return credentials;
+    });
+    const result = await handleChat(post("/v1/chat/completions", {
+      model: "Main", messages: [{ role: "user", content: "Question" }],
+    }, "sk-combo", {}, parent.signal));
+    expect(result.status).toBe(499);
+    expect(mocks.getProviderCredentials).toHaveBeenCalledTimes(1);
+    expect(mocks.checkAndRefreshToken).toHaveBeenCalledTimes(1);
+    expect(mocks.handleChatCore).not.toHaveBeenCalled();
+  });
   it("rejects an unlisted external Fusion judge before any credential or model call", async () => {
     fx.settings = { comboStrategies: { Main: { fallbackStrategy: "fusion", judgeModel: "openai/external" } } };
     const result = await chat("Main", "sk-combo");
