@@ -661,6 +661,17 @@ Seamless translation between formats:
 - Name your combos for easy access
 - Share combos across devices with Cloud Sync
 
+#### Fusion consultation
+
+Choose **Fusion** and a judge on the Combos page. The judge sees the conversation, selects panel slots in one `consult_panel` call, then receives anonymous panel responses and a structured comparison before producing the next native answer or application tool calls. Fusion does not execute application tools.
+
+- **Min panels / Max panels** default to all configured slots. Bounds must satisfy `0 <= minPanels <= maxPanels <= slot count`. Duplicate models remain separate slots. A zero minimum permits a direct response; zero maximum disables consultation. With no slots, configure an explicit judge.
+- Every selected slot runs concurrently. Technical failures abort the request and siblings; weak readable answers go to evaluation. There is no partial-panel quorum, automatic model-output repair, or Fusion retry.
+- Initial judge, panels, and analyst are buffered. Only final synthesis streams; tool-call events are held until validated. Once text has streamed, failures use stream error events, not a new HTTP status. Streamed text/schema correctness remains provider-enforced; buffered answers are validated locally.
+- Supports OpenAI Chat, Claude Messages, and OpenAI Responses clients with JSON function tools. Unsupported native/hosted tools, nested combos, Responses `previous_response_id`, and Claude media that cannot survive translation are rejected before model calls. Supply explicit history.
+- Client cancellation aborts internal work. No Fusion-specific deadline is added; existing provider, transport, and stream-stall limits still apply. Public usage belongs to the delivered judge completion; internal calls retain separate usage records. `fusion_no_usable_action` includes `retryable: false` when no usable action satisfies the client constraints.
+- Web search/fetch execution inside panels is not implemented.
+
 ### 📝 Request Logging
 
 - Enable debug mode for full request/response logs
