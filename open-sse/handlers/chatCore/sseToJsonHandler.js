@@ -112,7 +112,7 @@ function chatCompletionToResponses(responseBody, customToolNames = null) {
  * Parse OpenAI-style SSE text into a single chat completion JSON.
  * Used when provider forces streaming but client wants non-streaming.
  */
-export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
+export function parseSSEToOpenAIResponse(rawSSE, fallbackModel, { strict = false } = {}) {
   const chunks = [];
   let streamError = null;
 
@@ -125,11 +125,11 @@ export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
       const chunk = JSON.parse(payload);
       if (chunk?.error) streamError = chunk.error;
       else chunks.push(chunk);
-    } catch { /* ignore malformed lines */ }
+    } catch { if (strict) return null; }
   }
 
   if (streamError) return { error: streamError };
-  if (chunks.length === 0) return null;
+  if (chunks.length === 0 || (strict && !chunks.some((chunk) => Array.isArray(chunk.choices) && chunk.choices[0]?.delta))) return null;
 
   const first = chunks[0];
   const contentParts = [];
@@ -206,7 +206,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
   const isCodexResponsesApi = isResponsesProvider(provider) || targetFormat === FORMATS.OPENAI_RESPONSES;
   if (isCodexResponsesApi) {
     try {
-      const jsonResponse = await convertResponsesStreamToJson(providerResponse.body);
+      const jsonResponse = await convertResponsesStreamToJson(providerResponse.body, { strict: internal });
       if (onRequestSuccess) await onRequestSuccess();
 
       const usage = jsonResponse.usage || {};
@@ -308,7 +308,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
   // Standard Chat Completions SSE path
   try {
     const sseText = await providerResponse.text();
-    const parsed = parseSSEToOpenAIResponse(sseText, model);
+    const parsed = parseSSEToOpenAIResponse(sseText, model, { strict: internal });
     if (!parsed) return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid SSE response for non-streaming request");
     if (parsed.error) {
       // Structured error chunks may carry the real upstream status (e.g. the

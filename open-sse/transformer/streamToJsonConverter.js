@@ -12,7 +12,10 @@ function processSSEMessage(msg, state) {
 
   const eventMatch = msg.match(/^event:\s*(.+)$/m);
   const dataMatch = msg.match(/^data:\s*(.+)$/m);
-  if (!eventMatch || !dataMatch) return;
+  if (!eventMatch || !dataMatch) {
+    if (state.strict && msg.includes("data:")) throw new Error("Invalid Responses event framing");
+    return;
+  }
 
   const eventType = eventMatch[1].trim();
   const dataStr = dataMatch[1].trim();
@@ -20,7 +23,10 @@ function processSSEMessage(msg, state) {
 
   let parsed;
   try { parsed = JSON.parse(dataStr); }
-  catch { return; }
+  catch {
+    if (state.strict) throw new Error("Invalid Responses event JSON");
+    return;
+  }
 
   if (eventType === "response.created") {
     state.responseId = parsed.response?.id || state.responseId;
@@ -29,12 +35,18 @@ function processSSEMessage(msg, state) {
     state.items.set(parsed.output_index ?? 0, parsed.item);
   } else if (eventType === "response.completed" || eventType === "response.done") {
     state.status = "completed";
+    if (state.strict && parsed.response?.output) {
+      parsed.response.output.forEach((item, index) => state.items.set(index, item));
+    }
     if (parsed.response?.usage) {
       state.usage.input_tokens = parsed.response.usage.input_tokens || 0;
       state.usage.output_tokens = parsed.response.usage.output_tokens || 0;
       state.usage.total_tokens = parsed.response.usage.total_tokens || 0;
     }
-  } else if (eventType === "response.failed") {
+  } else if (eventType === "response.incomplete" && state.strict) {
+    state.status = "incomplete";
+    for (const [index, item] of (parsed.response?.output || []).entries()) state.items.set(index, item);
+  } else if (eventType === "response.failed" || (eventType === "error" && state.strict)) {
     state.status = "failed";
   }
 }
@@ -46,7 +58,7 @@ const EMPTY_RESPONSE = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
  * @param {ReadableStream} stream - SSE stream from provider
  * @returns {Promise<Object>} Final JSON response in Responses API format
  */
-export async function convertResponsesStreamToJson(stream) {
+export async function convertResponsesStreamToJson(stream, { strict = false } = {}) {
   if (!stream || typeof stream.getReader !== "function") {
     return { id: `resp_${Date.now()}`, object: "response", created_at: Math.floor(Date.now() / 1000), status: "failed", output: [], usage: { ...EMPTY_RESPONSE } };
   }
@@ -56,6 +68,7 @@ export async function convertResponsesStreamToJson(stream) {
   let buffer = "";
 
   const state = {
+    strict,
     responseId: "",
     created: Math.floor(Date.now() / 1000),
     status: "in_progress",
@@ -69,6 +82,7 @@ export async function convertResponsesStreamToJson(stream) {
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
+      if (strict) buffer = buffer.replace(/\r\n/g, "\n");
       const messages = buffer.split("\n\n");
       buffer = messages.pop() || "";
 
@@ -83,6 +97,10 @@ export async function convertResponsesStreamToJson(stream) {
     }
   } finally {
     reader.releaseLock();
+  }
+
+  if (strict && !["completed", "incomplete"].includes(state.status)) {
+    throw new Error("Responses stream did not complete a readable response");
   }
 
   // Build output array from accumulated items (ordered by index)
