@@ -173,6 +173,17 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
     }
   }
 
+  if (body.tool_choice?.type === OPENAI_BLOCK.FUNCTION) {
+    result.tool_choice = { type: OPENAI_BLOCK.FUNCTION, function: { name: body.tool_choice.name } };
+  }
+  if (body.text?.format) {
+    const format = body.text.format;
+    result.response_format = format.type === "json_schema"
+      ? { type: "json_schema", json_schema: { name: format.name, schema: format.schema, ...(format.strict !== undefined ? { strict: format.strict } : {}) } }
+      : format;
+  }
+  delete result.text;
+
   // Convert tools format.
   // Responses API supports "hosted" tools (e.g. { type: "request_user_input" }) that carry no
   // explicit `name` field and cannot be represented as Chat Completions function declarations.
@@ -454,6 +465,18 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
     result.max_output_tokens = body.max_tokens;
   }
   if (body.top_p !== undefined) result.top_p = body.top_p;
+  if (body.tool_choice !== undefined) {
+    result.tool_choice = body.tool_choice?.type === OPENAI_BLOCK.FUNCTION
+      ? { type: OPENAI_BLOCK.FUNCTION, name: body.tool_choice.function?.name || body.tool_choice.name }
+      : body.tool_choice;
+  }
+  if (body.parallel_tool_calls !== undefined) result.parallel_tool_calls = body.parallel_tool_calls;
+  if (body.response_format) {
+    const format = body.response_format;
+    result.text = { format: format.type === "json_schema"
+      ? { type: "json_schema", ...format.json_schema }
+      : format };
+  }
   if (body.reasoning !== undefined) result.reasoning = body.reasoning;
   if (body.reasoning_effort !== undefined) result.reasoning = { effort: body.reasoning_effort, summary: "auto" };
   if (body.service_tier !== undefined) result.service_tier = body.service_tier;
