@@ -24,7 +24,8 @@ import {
   getRefreshLeadMs as _getRefreshLeadMs
 } from "open-sse/services/tokenRefresh.js";
 import {
-  refreshProviderCredentials as _refreshProviderCredentials,
+  withCredentialRefreshLock,
+  mergeRefreshedCredentials,
   shouldRefreshCredentials as _shouldRefreshCredentials,
 } from "open-sse/services/oauthCredentialManager.js";
 
@@ -125,8 +126,8 @@ function needsProjectId(provider) {
  * @param {string} connectionId
  * @param {string} accessToken
  */
-function _refreshProjectId(provider, connectionId, accessToken) {
-  if (!needsProjectId(provider) || !connectionId || !accessToken) return;
+function _refreshProjectId(provider, connectionId, accessToken, signal) {
+  if (signal?.aborted || !needsProjectId(provider) || !connectionId || !accessToken) return;
 
   // Invalidate the stale cached entry so getProjectIdForConnection does a real fetch
   invalidateProjectId(connectionId);
@@ -137,8 +138,8 @@ function _refreshProjectId(provider, connectionId, accessToken) {
   if (process.env.EAGER_PROJECT_ID_REFRESH === "true") {
     getProjectIdForConnection(connectionId, accessToken, provider)
       .then((projectId) => {
-        if (!projectId) return;
-        updateProviderCredentials(connectionId, { projectId }).catch((err) => {
+        if (signal?.aborted || !projectId) return;
+        updateProviderCredentials(connectionId, { projectId }, { signal }).catch((err) => {
           log.debug("TOKEN_REFRESH", "Failed to persist refreshed projectId", {
             connectionId,
             error: err?.message ?? err,
@@ -164,7 +165,8 @@ function _refreshProjectId(provider, connectionId, accessToken) {
  * @param {object} newCredentials
  * @returns {Promise<boolean>}
  */
-export async function updateProviderCredentials(connectionId, newCredentials) {
+export async function updateProviderCredentials(connectionId, newCredentials, { signal } = {}) {
+  signal?.throwIfAborted();
   try {
     const updates = {};
 
@@ -199,13 +201,16 @@ export async function updateProviderCredentials(connectionId, newCredentials) {
     }
     if (newCredentials.projectId)            updates.projectId = newCredentials.projectId;
 
+    signal?.throwIfAborted();
     const result = await updateProviderConnection(connectionId, updates);
+    signal?.throwIfAborted();
     log.info("TOKEN_REFRESH", "Credentials updated in localDb", {
       connectionId,
       success: !!result
     });
     return !!result;
   } catch (error) {
+    signal?.throwIfAborted();
     log.error("TOKEN_REFRESH", "Error updating credentials in localDb", {
       connectionId,
       error: error.message,
@@ -222,11 +227,13 @@ export async function updateProviderCredentials(connectionId, newCredentials) {
  *
  * @param {string} provider
  * @param {object} credentials
- * @param {{ force?: boolean }} [options]  force=true skips the on-request lead check
+ * @param {{ force?: boolean, signal?: AbortSignal }} [options] force=true skips the on-request lead check
  *   (used by background scheduler which applies a larger lead). Request path omits this.
  * @returns {Promise<object>} updated credentials object
  */
 export async function checkAndRefreshToken(provider, credentials, options = {}) {
+  const signal = options?.signal;
+  signal?.throwIfAborted();
   let creds = { ...credentials };
   if (!creds.connectionId && creds.id) {
     creds.connectionId = creds.id;
@@ -236,6 +243,7 @@ export async function checkAndRefreshToken(provider, credentials, options = {}) 
   // refreshing with a stale snapshot (reuse) revokes the whole session → account logout.
   if (creds.connectionId) {
     const latest = await getProviderConnectionById(creds.connectionId).catch(() => null);
+    signal?.throwIfAborted();
     const latestRefreshMs = Date.parse(latest?.lastRefreshAt || "");
     const credsRefreshMs = Date.parse(creds.lastRefreshAt || "");
     const dbIsNewer = Number.isFinite(latestRefreshMs)
@@ -266,7 +274,26 @@ export async function checkAndRefreshToken(provider, credentials, options = {}) 
       lastRefreshAt: creds.lastRefreshAt || null,
     });
 
-    const newCreds = await _refreshProviderCredentials(provider, creds, log);
+    const newCreds = await withCredentialRefreshLock(provider, creds, async () => {
+      signal?.throwIfAborted();
+      let refreshed;
+      try {
+        refreshed = await _refreshTokenByProvider(provider, creds, log);
+      } catch (error) {
+        signal?.throwIfAborted();
+        throw error;
+      }
+      return mergeRefreshedCredentials(provider, creds, refreshed);
+    });
+    if (signal?.aborted && newCreds?.refreshToken && newCreds.refreshToken !== creds.refreshToken) {
+      // A completed rotation consumed the old token. Save its replacement even
+      // after cancellation, but do not start any further request work.
+      await updateProviderCredentials(creds.connectionId, {
+        ...newCreds,
+        existingProviderSpecificData: creds.providerSpecificData,
+      });
+    }
+    signal?.throwIfAborted();
     if (newCreds?.accessToken || newCreds?.apiKey || newCreds?.copilotToken) {
       const mergedCreds = {
         ...newCreds,
@@ -274,7 +301,8 @@ export async function checkAndRefreshToken(provider, credentials, options = {}) 
       };
 
       // Persist to DB (non-blocking path continues below)
-      await updateProviderCredentials(creds.connectionId, mergedCreds);
+      await updateProviderCredentials(creds.connectionId, mergedCreds, { signal });
+      signal?.throwIfAborted();
 
       creds = {
         ...creds,
@@ -288,7 +316,7 @@ export async function checkAndRefreshToken(provider, credentials, options = {}) 
       };
 
       // Non-blocking: refresh projectId with the new access token
-      _refreshProjectId(provider, creds.connectionId, creds.accessToken);
+      _refreshProjectId(provider, creds.connectionId, creds.accessToken, signal);
     }
   }
 
@@ -307,7 +335,9 @@ export async function checkAndRefreshToken(provider, credentials, options = {}) 
         expiresIn: copilotToken ? Math.round(remaining / 1000) : "missing",
       });
 
+      signal?.throwIfAborted();
       const copilotTokenResult = await refreshCopilotToken(creds.accessToken);
+      signal?.throwIfAborted();
       if (copilotTokenResult) {
         const updatedSpecific = {
           ...creds.providerSpecificData,
@@ -317,7 +347,8 @@ export async function checkAndRefreshToken(provider, credentials, options = {}) 
 
         await updateProviderCredentials(creds.connectionId, {
           providerSpecificData: updatedSpecific,
-        });
+        }, { signal });
+        signal?.throwIfAborted();
 
         creds.providerSpecificData = updatedSpecific;
         creds.copilotToken = copilotTokenResult.token;

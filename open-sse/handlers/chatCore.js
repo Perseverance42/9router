@@ -455,23 +455,41 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       // providers (xAI/grok-cli) issue a new RT on every refresh; without this,
       // refreshWithRetry's 2nd/3rd attempt reuses the already-consumed RT →
       // invalid_grant → auth_failed retryable=false.
+      let rotationPersisted = false;
       const newCredentials = await refreshWithRetry(async () => {
-        externalSignal?.throwIfAborted();
+        streamController.signal.throwIfAborted();
         const result = await executor.refreshCredentials(credentials, log);
         if (result?.refreshToken && result.refreshToken !== credentials.refreshToken) {
           if (result.accessToken) credentials.accessToken = result.accessToken;
           credentials.refreshToken = result.refreshToken;
+          if (onCredentialsRefreshed) {
+            // The old token was consumed. Save the replacement before yielding
+            // again, even if cancellation already happened during refresh.
+            try {
+              await onCredentialsRefreshed(result, { preserveRotatedToken: true });
+              rotationPersisted = true;
+            } catch (error) {
+              streamController.signal.throwIfAborted();
+              log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${error.message}`);
+            }
+          }
         }
+        streamController.signal.throwIfAborted();
         return result;
-      }, 3, log);
+      }, 3, log, streamController.signal);
       if (newCredentials?.accessToken || newCredentials?.copilotToken) {
         if (log?.line) log.line(reqTag, "🔑", `TOKEN REFRESHED · ${provider}/${model}`);
         Object.assign(credentials, newCredentials);
-        if (onCredentialsRefreshed) {
-          try { await onCredentialsRefreshed(newCredentials); } catch (e) { log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`); }
+        streamController.signal.throwIfAborted();
+        if (onCredentialsRefreshed && !rotationPersisted) {
+          try { await onCredentialsRefreshed(newCredentials); } catch (e) {
+            streamController.signal.throwIfAborted();
+            log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`);
+          }
         }
+        streamController.signal.throwIfAborted();
         try {
-          externalSignal?.throwIfAborted();
+          streamController.signal.throwIfAborted();
           const retryResult = await executor.execute({
             model,
             body: translatedBody,
@@ -484,6 +502,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
             proxyOptions,
             providerOverrides,
           });
+          if (streamController.signal.aborted) {
+            retryResult.response.body?.cancel().catch(() => {});
+            streamController.signal.throwIfAborted();
+          }
           if (retryResult.response.ok) {
             providerResponse = retryResult.response;
             providerUrl = retryResult.url;
@@ -496,6 +518,12 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     } catch (e) {
       log?.warn?.("TOKEN", `${provider.toUpperCase()} | refresh threw: ${e.message}`);
     }
+  }
+
+  if (streamController.signal.aborted) {
+    streamController.handleComplete();
+    providerResponse.body?.cancel().catch(() => {});
+    return createErrorResult(499, "Request aborted");
   }
 
   // Provider returned error
