@@ -194,8 +194,10 @@ function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAcce
     preflight: execution.internal ? undefined : async (models, canonical) => {
       const required = detectRequiredCapabilities(canonical);
       const settings = await getSettings();
-      const completed = new Set();
+      // Cache maximum remaining combo depth so deeper incoming DAG paths stay bounded.
+      const completed = new Map();
       const visit = async (targets, members, path) => {
+        let maxDepth = 0;
         for (const target of targets) {
           signal?.throwIfAborted();
           // A combo grants its members, not an independently configured judge.
@@ -204,7 +206,13 @@ function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAcce
             if (denied) return denied;
           }
           if (path.includes(target)) throw new Error(`Cyclic or too deeply nested combo: ${target}`);
-          if (completed.has(target)) continue;
+          if (completed.has(target)) {
+            const depth = completed.get(target);
+            if (path.length + depth > 32) throw new Error(`Cyclic or too deeply nested combo: ${target}`);
+            maxDepth = Math.max(maxDepth, depth);
+            continue;
+          }
+          let depth = 0;
           const info = await getModelInfo(target);
           if (!info.provider) {
             const children = await getComboModels(target, { allowEmpty: true });
@@ -220,16 +228,19 @@ function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAcce
               }
             }
             const judge = strategy === "fusion" ? cfg.judgeModel?.trim() || children[0] : null;
-            const denied = await visit([...new Set([...children, ...(judge ? [judge] : [])])], children, [...path, target]);
-            if (denied) return denied;
+            const childDepth = await visit([...new Set([...children, ...(judge ? [judge] : [])])], children, [...path, target]);
+            if (childDepth instanceof Response) return childDepth;
+            depth = childDepth + 1;
           } else {
             const caps = getCapabilitiesForModel(info.provider, info.model);
             for (const capability of ["vision", "pdf", "audioInput", "videoInput"]) {
               if (required.has(capability) && !caps[capability]) throw new Error(`Fusion target ${target} lacks ${capability}`);
             }
           }
-          completed.add(target);
+          completed.set(target, depth);
+          maxDepth = Math.max(maxDepth, depth);
         }
+        return maxDepth;
       };
       return visit(models, comboModels, execution.comboPath || []);
     },

@@ -242,6 +242,21 @@ it("checks shared DAG subtrees once per request", async () => {
   expect(mocks.lookup.mock.calls.length).toBeLessThan(110);
 });
 
+it.each([29, 30])("checks cached subtree depth on a shallow-first DAG with %i intervening combos", async (length) => {
+  add("Main", ["Shared", "Level0"], { fallbackStrategy: "fusion", judgeModel: "openai/judge", fusionTuning: { minPanels: 0, maxPanels: 0 } });
+  add("Shared", ["Tail"]);
+  add("Tail", ["openai/panel"]);
+  for (let i = 0; i < length; i++) add(`Level${i}`, [i === length - 1 ? "Shared" : `Level${i + 1}`]);
+  const result = await chat();
+  expect(result.status).toBe(length === 29 ? 200 : 400);
+  if (length === 30) {
+    expect((await result.json()).error.message).toContain("too deeply nested combo: Shared");
+    expect(mocks.credentials).not.toHaveBeenCalled();
+    expect(mocks.core).not.toHaveBeenCalled();
+    expect(mocks.systemone).not.toHaveBeenCalled();
+  }
+});
+
 it("checks an incoming external edge even when its target subtree is cached", async () => {
   add("Main", ["Shared", "Nested"], { fallbackStrategy: "fusion", judgeModel: "Shared" });
   add("Shared", ["openai/panel"]);
