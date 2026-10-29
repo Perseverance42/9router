@@ -489,17 +489,21 @@ export async function handleComboChat({
 
     try {
       let result = await handleSingleModel(body, modelStr);
+      if (signal?.aborted) {
+        await result.body?.cancel().catch(() => {});
+        signal.throwIfAborted();
+      }
       if (routeweave && result.ok && (result.headers.get("content-type") || "").includes("application/json")) {
         const checked = await checkRouteweaveJson(result);
+        if (signal?.aborted) {
+          await checked.response.body?.cancel().catch(() => {});
+          signal.throwIfAborted();
+        }
         if (checked.noRetry) return selected(checked.response, modelStr);
         result = checked.valid ? checked.response : Response.json({ error: { message: "Unusable RouteWeave completion" } }, { status: 502 });
       }
       const upstreamEvidence = getRouteweaveEvidence(result);
       const preserveEvidence = response => upstreamEvidence ? setRouteweaveEvidence(response, upstreamEvidence) : response;
-      if (signal?.aborted) {
-        await result.body?.cancel().catch(() => {});
-        signal.throwIfAborted();
-      }
       
       // Success (2xx). A 2xx is necessary but NOT sufficient: Gemini aborts (e.g.
       // MALFORMED_FUNCTION_CALL) still return 200 and stream empty content, which would
@@ -509,12 +513,16 @@ export async function handleComboChat({
         let peeked = null;
         try {
           peeked = await peekComboResponse(result, log, routeweave);
+          if (signal?.aborted) {
+            await (peeked?.response || result).body?.cancel().catch(() => {});
+            signal.throwIfAborted();
+          }
         } catch (peekErr) {
           // peekStreamForContent is written not to throw; if reconstruction/Response
           // construction ever does, result.body is already locked by getReader() and can no
           // longer be streamed. Returning `result` would hand the client a locked, unreadable
           // body. Degrade to a clean, valid (empty) SSE stream instead.
-          if (routeweave) throw peekErr;
+          if (routeweave || signal?.aborted) throw peekErr;
           log.warn("COMBO", `empty-peek error on ${modelStr}, returning empty SSE: ${peekErr?.message || peekErr}`);
           return new Response("data: [DONE]\n\n", {
             status: 200,

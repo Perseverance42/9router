@@ -388,7 +388,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       }
     });
 
-    assertRouteweaveDispatch(execution?.expiresAt, signal);
+    if (signal?.aborted) {
+      await result.response?.body?.cancel().catch(() => {});
+      signal.throwIfAborted();
+    }
     if (result.success) return result.response;
 
     // Antigravity 409/429: refresh live quota to get exact resetAt before locking
@@ -414,6 +417,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       lastError = result.error;
       lastStatus = result.status;
       lastHeaders = upstreamResponseHeaders(result.response?.headers);
+      await result.response?.body?.cancel().catch(() => {});
       continue;
     }
 

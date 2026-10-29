@@ -305,6 +305,40 @@ test("bounded JSON, buffered SSE and oversized frames reject before EOF and canc
 });
 
 
+test("cancellation during JSON validation cannot select a success or refusal", async () => {
+  for (const payload of [answer, { choices: [{ message: { refusal: "No" }, finish_reason: "content_filter" }] }]) {
+    const controller = new AbortController();
+    let calls = 0, selected = 0;
+    const response = new Response(new ReadableStream({ start(stream) {
+      stream.enqueue(new TextEncoder().encode(JSON.stringify(payload)));
+    }, pull(stream) { controller.abort(); stream.close(); } }, { highWaterMark: 0 }), { headers: { "content-type": "application/json" } });
+    await assert.rejects(handleComboChat({ body, models, log, routeweave: true, externalOrder: true,
+      signal: controller.signal, onSelected: () => { selected++; },
+      handleSingleModel: async () => { calls++; return response; },
+    }), /abort/i);
+    assert.equal(selected, 0);
+    assert.equal(calls, 1);
+  }
+});
+
+test("cancellation during SSE peeking cancels the abandoned body without selecting HTTP 200", async () => {
+  for (const routeweave of [true, false]) {
+    const controller = new AbortController();
+    let calls = 0, selected = 0, cancelled = false;
+    const response = new Response(new ReadableStream({ pull(stream) {
+      stream.enqueue(new TextEncoder().encode(text));
+      controller.abort();
+    }, cancel() { cancelled = true; } }, { highWaterMark: 0 }), { headers: { "content-type": "text/event-stream" } });
+    await assert.rejects(handleComboChat({ body, models, log, routeweave, externalOrder: true,
+      signal: controller.signal, onSelected: () => { selected++; },
+      handleSingleModel: async () => { calls++; return response; },
+    }), /abort/i);
+    assert.equal(cancelled, true);
+    assert.equal(selected, 0);
+    assert.equal(calls, 1);
+  }
+});
+
 test("core maps Error-valued client cancellation to 499, not backend failure", async () => {
   const controller = new AbortController();
   globalThis.routeweaveBoundaryFetch = async () => { controller.abort(Error("client disconnected")); throw controller.signal.reason; };

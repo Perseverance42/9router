@@ -15,13 +15,14 @@ const mocks = new Map([
     export const extractApiKey = r => r.headers.get("authorization")?.replace(/^Bearer /, "") || null;
     export const isValidApiKey = async () => true;
     export const getProviderCredentials = async (...args) => { f.credentials.push(args); return { connectionId: "account", accessToken: "secret" }; };
-    export const markAccountUnavailable = async () => ({ shouldFallback: false });
+    export const markAccountUnavailable = async () => ({ shouldFallback: f.accountFallback });
     export const clearAccountError = async () => {};`],
   ["../services/model.js", `
     export const getComboModels = async id => f.combos[id] || null;
     export const getModelInfo = async id => { const slash = id.indexOf("/"); return slash < 0 ? { provider: null, model: id } : { provider: id.slice(0, slash), model: id.slice(slash + 1) }; };`],
   ["open-sse/handlers/chatCore.js", `export const handleChatCore = async options => {
     f.core.push(options);
+    if (f.onCore) return f.onCore(options);
     return { success: true, response: Response.json({ choices: [{ message: { content: options.body.model }, finish_reason: "stop" }] }) };
   };`],
   ["open-sse/services/combo.js", `
@@ -80,7 +81,7 @@ beforeEach(() => {
     settings: { comboStrategies: { target: { fallbackStrategy: "routeweave" } } },
     combos: { target: [...models] },
     decisions: [], feedback: [], native: [], fusion: [], classifier: [], core: [], credentials: [],
-    cancel: null,
+    cancel: null, onCore: null, accountFallback: false,
   });
   for (const k of envKeys) delete process.env[k];
   Object.assign(process.env, {
@@ -142,6 +143,44 @@ test("saved per-combo RouteWeave strategy activates without an environment name 
   assert.equal(fixture.decisions[0].mode, "active_required");
   assert.deepEqual(fixture.native[0].models, [...models].reverse());
   assert.equal(fixture.native[0].comboStrategy, "fallback");
+});
+
+test("valid dispatch may finish after expiry without admitting a later account attempt", async t => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  fixture.onCore = async options => {
+    assert.ok(now < options.routeweaveExpiresAt);
+    now = options.routeweaveExpiresAt + 1;
+    return { success: true, response: Response.json({ choices: [{ message: { content: "completed after expiry" }, finish_reason: "stop" }] }) };
+  };
+  const accepted = await chat();
+  assert.equal(accepted.response.status, 200);
+  assert.match(JSON.stringify(accepted.body), /completed after expiry/);
+
+  let cancelled = false;
+  fixture.accountFallback = true;
+  fixture.onCore = async options => {
+    assert.ok(now < options.routeweaveExpiresAt);
+    now = options.routeweaveExpiresAt + 1;
+    return { success: false, status: 503, error: "retryable", response: new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status: 503 }) };
+  };
+  const blocked = await chat();
+  assert.equal(blocked.response.status, 503);
+  assert.equal(fixture.core.length, 2);
+  assert.equal(fixture.credentials.length, 2);
+  assert.equal(cancelled, true);
+});
+
+test("cancelled core completion is abandoned and its body cancelled", async () => {
+  const controller = new AbortController();
+  let cancelled = false;
+  fixture.onCore = async () => {
+    controller.abort();
+    return { success: true, response: new Response(new ReadableStream({ cancel() { cancelled = true; } })) };
+  };
+  assert.equal((await chat("target", { signal: controller.signal })).response.status, 499);
+  assert.equal(cancelled, true);
+  assert.equal(fixture.core.length, 1);
 });
 
 test("environment defaults to required mode and ignores the obsolete combo list", () => {
