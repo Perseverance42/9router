@@ -149,10 +149,11 @@ export function isNoRetryFinish(finishReason) {
 // possibly-valid slow stream). Returns the decision, the buffered head bytes, the live reader,
 // and — if the deadline fired mid-read — the still-pending read() (`pendingRead`) so the caller
 // can resume from it WITHOUT abandoning the chunk it will deliver.
-export async function peekStreamForContent(body, { deadlineMs = EMPTY_PEEK_DEADLINE_MS } = {}) {
+export async function peekStreamForContent(body, { deadlineMs = EMPTY_PEEK_DEADLINE_MS, maxBytes = Infinity } = {}) {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const headChunks = [];
+  let headBytes = 0;
   const state = { sawContent: false, finishReason: null };
   let textBuf = "";
 
@@ -185,6 +186,11 @@ export async function peekStreamForContent(body, { deadlineMs = EMPTY_PEEK_DEADL
     if (done) {
       if (textBuf) scanSSEBuffer(textBuf + "\n", state); // final line without a trailing newline
       return settle({ outcome: state.sawContent ? "content" : "empty", timedOut: false, head: headChunks, reader, pendingRead: null, finishReason: state.finishReason });
+    }
+    headBytes += value.byteLength;
+    if (headBytes > maxBytes) {
+      await reader.cancel().catch(() => {});
+      return settle({ outcome: "empty", timedOut: false, head: [], reader, pendingRead: null, finishReason: "oversized_prefix" });
     }
     headChunks.push(value);
     textBuf += decoder.decode(value, { stream: true });

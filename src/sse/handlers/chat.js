@@ -11,6 +11,7 @@ import { handleAntigravityQuotaError, clearAntigravityStrikes } from "../service
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
+import { assertRouteweaveDispatch } from "open-sse/services/routeweaveRoute.js";
 import { DEFAULT_HEADROOM_URL } from "@/lib/headroom/detect";
 import { getTransform as getPxpipeTransform } from "@/lib/pxpipe/loader.js";
 import { appendPxpipeEvent } from "@/lib/pxpipe/events.js";
@@ -23,6 +24,7 @@ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import { resolveSessionIdentity } from "open-sse/utils/sessionManager.js";
 import * as log from "../utils/logger.js";
+import { readRouteweaveConfig, handleRouteweaveCombo } from "../services/routeweave.mjs";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
@@ -99,9 +101,14 @@ export async function handleChat(request, clientRawRequest = null) {
   const keyAccessDenied = await enforceKeyAccess(keyAccess, modelStr);
   if (keyAccessDenied) return keyAccessDenied;
 
+  let routeweave;
+  try { routeweave = readRouteweaveConfig(modelStr); } catch {
+    return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, "Invalid RouteWeave server configuration");
+  }
+
   // Bypass naming/warmup requests before combo rotation to avoid wasting rotation slots
   const userAgent = request?.headers?.get("user-agent") || "";
-  const bypassResponse = handleBypassRequest(body, modelStr, userAgent, !!settings.ccFilterNaming);
+  const bypassResponse = routeweave ? null : handleBypassRequest(body, modelStr, userAgent, !!settings.ccFilterNaming);
   if (bypassResponse) return bypassResponse.response || bypassResponse;
 
   const requiredCapabilities = detectRequiredCapabilities(body);
@@ -113,6 +120,24 @@ export async function handleChat(request, clientRawRequest = null) {
     const comboStrategies = settings.comboStrategies || {};
     const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
     const comboStrategy = comboSpecificStrategy || settings.comboStrategy || "fallback";
+    if (routeweave) {
+      if (["rtkEnabled", "headroomEnabled", "cavemanEnabled", "ponytailEnabled", "customPromptEnabled", "pxpipeEnabled"].some(key => settings[key]) || Object.values(settings.providerThinking || {}).some(Boolean)) {
+        return errorResponse(422, "RouteWeave requires request transforms and thinking overrides disabled");
+      }
+      const cfg = comboStrategies[modelStr] || {};
+      return handleRouteweaveCombo({
+        config: routeweave, body, models: comboModels, signal: request.signal,
+        resolveModel: getModelInfo, runCombo: handleComboChat,
+        dispatch: (b, m, execution) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, request.signal, execution),
+        nativeOptions: {
+          log, comboName: modelStr, comboStrategy,
+          comboStickyLimit: settings.comboStickyRoundRobinLimit, sessionId,
+          smartPolicy: cfg.smartPolicy || "smart", sessionSticky: cfg.sessionSticky !== false,
+          confidenceThreshold: cfg.confidenceThreshold ?? 0.8,
+          resolveSmartChoice: comboStrategy === "smart" ? (b, m) => resolveSmartChoice({ body: b, models: m, routerModel: cfg.routerModel, log }) : null,
+        },
+      });
+    }
     const augmentedModels = await filterAdapterModels(keyAccess, augmentModelsWithCapacityAdapter(comboModels, requiredCapabilities, settings), comboModels);
     const adapterAdded = augmentedModels.filter((m) => !comboModels.includes(m));
 
@@ -165,6 +190,8 @@ export async function handleChat(request, clientRawRequest = null) {
     });
   }
 
+  if (routeweave) return errorResponse(422, "RouteWeave opt-in requires a flat combo");
+
   // Single model request — may still switch to a capacity-adapter model if the
   // target lacks a capability the request needs (e.g. no vision, request has an image).
   const soloAugmented = await filterAdapterModels(keyAccess, augmentModelsWithCapacityAdapter([modelStr], requiredCapabilities, settings), [modelStr]);
@@ -190,8 +217,10 @@ export async function handleChat(request, clientRawRequest = null) {
 /**
  * Handle single model chat request
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, signal = null, execution = null) {
+  signal?.throwIfAborted();
   const modelInfo = await getModelInfo(modelStr);
+  signal?.throwIfAborted();
 
   // If provider is null, this might be a combo name - check and handle
   if (!modelInfo.provider) {
@@ -277,7 +306,9 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   let lastHeaders = null;
 
   while (true) {
+    assertRouteweaveDispatch(execution?.expiresAt, signal);
     const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { requestedModel: requestedModel || model });
+    assertRouteweaveDispatch(execution?.expiresAt, signal);
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
@@ -297,6 +328,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Account selection shown in the unified "▶" line (acc:...)
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
+    assertRouteweaveDispatch(execution?.expiresAt, signal);
 
     // Ensure real project ID is available for providers that need it (P0 fix: cold miss)
     if ((provider === "antigravity" || provider === "gemini-cli") && !refreshedCredentials.projectId) {
@@ -311,8 +343,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     // Use shared chatCore
     const chatSettings = await getSettings();
     const providerThinking = (chatSettings.providerThinking || {})[provider] || null;
+    assertRouteweaveDispatch(execution?.expiresAt, signal);
     const result = await handleChatCore({
       body: { ...body, model: `${provider}/${model}` },
+      signal,
+      routeweave: execution !== null,
+      routeweaveExpiresAt: execution?.expiresAt,
       modelInfo: { provider, model },
       credentials: refreshedCredentials,
       log,
@@ -357,6 +393,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       }
     });
 
+    assertRouteweaveDispatch(execution?.expiresAt, signal);
     if (result.success) return result.response;
 
     // Antigravity 409/429: refresh live quota to get exact resetAt before locking

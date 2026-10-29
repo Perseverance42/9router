@@ -10,7 +10,7 @@ import { getModelInfo } from "../services/model.js";
 import { getKeyAccessContext, enforceKeyAccessResolved } from "../services/keyAccess.js";
 import { handleSystemoneCore } from "open-sse/handlers/systemoneCore.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
-import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
+import { HTTP_STATUS, SYSTEMONE_TOTAL_TIMEOUT_MS } from "open-sse/config/runtimeConfig.js";
 import * as log from "../utils/logger.js";
 import { checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { saveRequestUsage } from "@/lib/usageDb.js";
@@ -22,6 +22,19 @@ import { saveRequestUsage } from "@/lib/usageDb.js";
  * @param {Request} request
  */
 export async function handleSystemone(request) {
+  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(SYSTEMONE_TOTAL_TIMEOUT_MS)]);
+  const cancelled = () => errorResponse(signal.reason?.name === "TimeoutError" ? 504 : 499, "System One cancelled or deadline exceeded");
+  if (signal.aborted) return cancelled();
+  let onAbort;
+  try {
+    return await Promise.race([
+      handleSystemoneRequest(request, signal),
+      new Promise(resolve => { onAbort = () => resolve(cancelled()); signal.addEventListener("abort", onAbort, { once: true }); }),
+    ]);
+  } finally { signal.removeEventListener("abort", onAbort); }
+}
+
+async function handleSystemoneRequest(request, signal) {
   let body;
   try {
     body = await request.json();
@@ -92,7 +105,9 @@ export async function handleSystemone(request) {
   let lastStatus = null;
 
   while (true) {
+    signal.throwIfAborted();
     const credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
+    signal.throwIfAborted();
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
@@ -114,8 +129,10 @@ export async function handleSystemone(request) {
 
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
 
+    signal.throwIfAborted();
     const result = await handleSystemoneCore({
       body,
+      signal,
       modelInfo: { provider, model },
       credentials: refreshedCredentials,
       log,
@@ -124,6 +141,7 @@ export async function handleSystemone(request) {
       }
     });
 
+    signal.throwIfAborted();
     if (result.success) {
       if (result.usage) {
         saveRequestUsage({

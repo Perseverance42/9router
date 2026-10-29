@@ -202,7 +202,9 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
     if (!message.content && !message.tool_calls) message.content = "";
 
     let finishReason = responseBody.stop_reason || "stop";
-    if (finishReason === "end_turn") finishReason = "stop";
+    if (finishReason === "end_turn" || finishReason === "stop_sequence") finishReason = "stop";
+    if (finishReason === "max_tokens") finishReason = "length";
+    if (finishReason === "refusal") finishReason = "content_filter";
     if (finishReason === "tool_use") finishReason = "tool_calls";
 
     const result = {

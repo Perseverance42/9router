@@ -8,6 +8,7 @@ import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { parseModel } from "./model.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
 import { peekStreamForContent, reconstructStream, isNoRetryFinish } from "./emptyFailover.js";
+import { checkRouteweaveJson, getRouteweaveEvidence, setRouteweaveEvidence } from "./routeweaveEvidence.js";
 import {
   getStickyComboModel,
   setStickyComboModel,
@@ -18,10 +19,10 @@ import {
 // Peek a 2xx combo response for real content. Returns null for non-SSE responses (leave
 // them untouched). For SSE, returns { outcome: "content"|"empty", finishReason, response }
 // where `response` is a faithful replay of the original stream (head buffer + live reader).
-async function peekComboResponse(result, log) {
+async function peekComboResponse(result, log, routeweave = false) {
   const ct = (result.headers.get("content-type") || "").toLowerCase();
   if (!result.body || !ct.includes("text/event-stream")) return null;
-  const peeked = await peekStreamForContent(result.body);
+  const peeked = await peekStreamForContent(result.body, routeweave ? { maxBytes: 256 * 1024 } : {});
   const response = new Response(reconstructStream(peeked.head, peeked.reader, peeked.pendingRead), {
     status: result.status,
     statusText: result.statusText,
@@ -365,11 +366,19 @@ export async function handleComboChat({
   sessionSticky = true,
   confidenceThreshold = 0.8,
   resolveSmartChoice = null,
+  externalOrder = false,
+  onSelected = null,
+  signal = null,
+  routeweave = false,
 }) {
+  signal?.throwIfAborted();
   let rotatedModels = models;
   let activeStickyModel = null;
 
-  if (comboStrategy === "smart") {
+  if (externalOrder) {
+    // Gateway already hard-admitted and ordered this pool; no native routing may compete.
+    rotatedModels = models;
+  } else if (comboStrategy === "smart") {
     const policy = (typeof smartPolicy === "string" ? smartPolicy : "smart").toLowerCase();
     const isPerTurn = policy === "per-turn" || sessionSticky === false;
     const isStrict = policy === "strict";
@@ -452,7 +461,7 @@ export async function handleComboChat({
   }
 
   // Auto-switch: float models that satisfy the request's required capabilities to the front.
-  if (autoSwitch) {
+  if (autoSwitch && !externalOrder) {
     const required = detectRequiredCapabilities(body);
     if (required.size > 0) {
       const reordered = reorderByCapabilities(rotatedModels, required);
@@ -467,13 +476,29 @@ export async function handleComboChat({
   let earliestRetryAfter = null;
   let lastStatus = null;
   let requestScopedResult = null;
+  const selected = (response, model) => {
+    onSelected?.(model);
+    return response;
+  };
 
   for (let i = 0; i < rotatedModels.length; i++) {
+    signal?.throwIfAborted();
     const modelStr = rotatedModels[i];
     log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
 
     try {
-      const result = await handleSingleModel(body, modelStr);
+      let result = await handleSingleModel(body, modelStr);
+      if (routeweave && result.ok && (result.headers.get("content-type") || "").includes("application/json")) {
+        const checked = await checkRouteweaveJson(result);
+        if (checked.noRetry) return selected(checked.response, modelStr);
+        result = checked.valid ? checked.response : Response.json({ error: { message: "Unusable RouteWeave completion" } }, { status: 502 });
+      }
+      const upstreamEvidence = getRouteweaveEvidence(result);
+      const preserveEvidence = response => upstreamEvidence ? setRouteweaveEvidence(response, upstreamEvidence) : response;
+      if (signal?.aborted) {
+        await result.body?.cancel().catch(() => {});
+        signal.throwIfAborted();
+      }
       
       // Success (2xx). A 2xx is necessary but NOT sufficient: Gemini aborts (e.g.
       // MALFORMED_FUNCTION_CALL) still return 200 and stream empty content, which would
@@ -482,12 +507,13 @@ export async function handleComboChat({
       if (result.ok) {
         let peeked = null;
         try {
-          peeked = await peekComboResponse(result, log);
+          peeked = await peekComboResponse(result, log, routeweave);
         } catch (peekErr) {
           // peekStreamForContent is written not to throw; if reconstruction/Response
           // construction ever does, result.body is already locked by getReader() and can no
           // longer be streamed. Returning `result` would hand the client a locked, unreadable
           // body. Degrade to a clean, valid (empty) SSE stream instead.
+          if (routeweave) throw peekErr;
           log.warn("COMBO", `empty-peek error on ${modelStr}, returning empty SSE: ${peekErr?.message || peekErr}`);
           return new Response("data: [DONE]\n\n", {
             status: 200,
@@ -520,12 +546,12 @@ export async function handleComboChat({
           }
 
           log.info("COMBO", `Model ${modelStr} succeeded`);
-          return result;
+          return selected(result, modelStr);
         }
 
         if (peeked.outcome === "content") {
           log.info("COMBO", `Model ${modelStr} succeeded${peeked.timedOut ? " (peek deadline; committed)" : ""}`);
-          return peeked.response;
+          return selected(preserveEvidence(peeked.response), modelStr);
         }
 
         // Empty generation. Fall through to the next candidate unless this is a legitimately
@@ -533,9 +559,14 @@ export async function handleComboChat({
         // (empty) response as-is, preserving prior behaviour rather than manufacturing a 5xx.
         const reasonLabel = peeked.finishReason || "no-content";
         const isLast = i === rotatedModels.length - 1;
-        if (isNoRetryFinish(peeked.finishReason) || isLast) {
+        if (routeweave && isNoRetryFinish(peeked.finishReason)) return selected(preserveEvidence(peeked.response), modelStr);
+        if (routeweave && isLast) {
+          await peeked.response.body?.cancel().catch(() => {});
+          throw Error("Unusable RouteWeave stream");
+        }
+        if ((!routeweave && isNoRetryFinish(peeked.finishReason)) || isLast) {
           log.warn("COMBO", `Model ${modelStr} returned empty (${reasonLabel}) — ${isNoRetryFinish(peeked.finishReason) ? "no-retry class" : "last candidate"}, returning as-is`);
-          return peeked.response;
+          return selected(preserveEvidence(peeked.response), modelStr);
         }
 
         log.warn("COMBO", `Model ${modelStr} returned empty (${reasonLabel}) — falling through to next candidate`);
@@ -613,6 +644,7 @@ export async function handleComboChat({
       if (!lastStatus) lastStatus = result.status;
       log.warn("COMBO", `Model ${modelStr} failed, trying next`, { status: result.status });
     } catch (error) {
+      signal?.throwIfAborted();
       // Catch unexpected exceptions to ensure fallback continues
       if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
         clearStickyComboSession(comboName, sessionId);

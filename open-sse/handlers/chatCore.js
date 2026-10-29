@@ -1,4 +1,6 @@
 import { detectFormat, getTargetFormat, resolveTransport } from "../services/provider.js";
+import { assertRouteweaveRoute, assertRouteweaveDispatch } from "../services/routeweaveRoute.js";
+import { inspectRouteweaveUpstream, setRouteweaveEvidence } from "../services/routeweaveEvidence.js";
 import { translateRequest } from "../translator/index.js";
 import { applyThinking, extractThinking, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
 import { FORMATS } from "../translator/formats.js";
@@ -61,7 +63,8 @@ export function stripContinuityFields(body) {
   return body;
 }
 
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides, signal, routeweave = false, routeweaveExpiresAt = null }) {
+  signal?.throwIfAborted();
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
   // Stable per-session color so all lines of one CLI conversation share a tag
@@ -77,7 +80,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const sourceFormat = sourceFormatOverride || detectFormat(body);
 
   // Check for bypass patterns (warmup, skip, cc naming)
-  const bypassResponse = handleBypassRequest(body, model, userAgent, ccFilterNaming);
+  const bypassResponse = routeweave ? null : handleBypassRequest(body, model, userAgent, ccFilterNaming);
   if (bypassResponse) return bypassResponse;
 
   const alias = PROVIDER_ID_TO_ALIAS[provider] || provider;
@@ -109,6 +112,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // OpenAI clients should stay on /chat/completions; other clients can fall
   // back to its declared Claude target).
   const targetFormat = useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
+  if (routeweave) assertRouteweaveRoute(modelInfo, targetFormat, body);
   if (useTransport && credentials) credentials.runtimeTransport = useTransport;
   const stripList = getModelStrip(alias, model);
 
@@ -127,6 +131,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   }
 
   const upstreamModel = getModelUpstreamId(alias, model, body);
+  if (routeweave) assertRouteweaveRoute({ provider, model: upstreamModel }, targetFormat, body);
 
   // Per-request opt-out: client can bypass all token savers via header
   const tokenSaverEnabled = clientRawRequest?.headers?.[TOKEN_SAVER_HEADER]?.toLowerCase() !== "off";
@@ -341,7 +346,9 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const msgCount = translatedBody.messages?.length || translatedBody.input?.length || translatedBody.contents?.length || translatedBody.request?.contents?.length || 0;
   log?.debug?.("REQUEST", `${provider.toUpperCase()} | ${model} | ${msgCount} msgs`);
 
+  signal?.throwIfAborted();
   const streamController = createStreamController({
+    signal,
     onDisconnect: (reason) => {
       trackPendingRequest(model, provider, connectionId, false);
       if (onDisconnect) onDisconnect(reason);
@@ -393,6 +400,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // exception: it is decoded by the executor into OpenAI-compatible output.
   let providerResponseFormat = targetFormat;
   try {
+    streamController.signal.throwIfAborted();
     const result = await executor.execute({
       model,
       body: translatedBody,
@@ -404,6 +412,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       log,
       proxyOptions,
       providerOverrides,
+      routeweaveExpiresAt,
     });
     providerResponse = result.response;
     providerUrl = result.url;
@@ -440,6 +449,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, errMsg);
   }
 
+  signal?.throwIfAborted();
   // Handle 401/403 - try token refresh (skip for noAuth providers)
   if (!executor.noAuth && (providerResponse.status === HTTP_STATUS.UNAUTHORIZED || providerResponse.status === HTTP_STATUS.FORBIDDEN)) {
     try {
@@ -448,7 +458,9 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       // refreshWithRetry's 2nd/3rd attempt reuses the already-consumed RT →
       // invalid_grant → auth_failed retryable=false.
       const newCredentials = await refreshWithRetry(async () => {
+        assertRouteweaveDispatch(routeweaveExpiresAt, signal);
         const result = await executor.refreshCredentials(credentials, log);
+        assertRouteweaveDispatch(routeweaveExpiresAt, signal);
         if (result?.refreshToken && result.refreshToken !== credentials.refreshToken) {
           if (result.accessToken) credentials.accessToken = result.accessToken;
           credentials.refreshToken = result.refreshToken;
@@ -462,6 +474,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
           try { await onCredentialsRefreshed(newCredentials); } catch (e) { log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`); }
         }
         try {
+          streamController.signal.throwIfAborted();
           const retryResult = await executor.execute({
             model,
             body: translatedBody,
@@ -473,11 +486,15 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
             log,
             proxyOptions,
             providerOverrides,
+            routeweaveExpiresAt,
           });
           if (retryResult.response.ok) {
+            await providerResponse.body?.cancel().catch(() => {});
             providerResponse = retryResult.response;
             providerUrl = retryResult.url;
             providerResponseFormat = retryResult.responseFormat || targetFormat;
+          } else {
+            await retryResult.response.body?.cancel().catch(() => {});
           }
         } catch { log?.warn?.("TOKEN", `${provider.toUpperCase()} | retry after refresh failed`); }
       } else {
@@ -488,6 +505,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     }
   }
 
+  signal?.throwIfAborted();
   // Provider returned error
   if (!providerResponse.ok) {
     trackPendingRequest(model, provider, connectionId, false, true);
@@ -513,6 +531,16 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     return createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers));
   }
 
+  let upstreamEvidence;
+  if (routeweave) {
+    const inspected = inspectRouteweaveUpstream(providerResponse, signal, !clientRequestedStreaming);
+    providerResponse = inspected.response;
+    upstreamEvidence = inspected.state;
+  }
+  const withEvidence = result => {
+    if (upstreamEvidence && result?.response) setRouteweaveEvidence(result.response, upstreamEvidence);
+    return result;
+  };
   const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log };
   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
@@ -523,19 +551,19 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // this path — handleForcedSSEToJson returns null when the body is not SSE.
   if (!clientRequestedStreaming && (providerRequiresStreaming || providerResponseFormat === FORMATS.OPENAI_RESPONSES)) {
     const result = await handleForcedSSEToJson({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, customToolNames, toolNameMap, trackDone, appendLog });
-    if (result) { streamController.handleComplete(); return result; }
+    if (result) { streamController.handleComplete(); return withEvidence(result); }
   }
 
   // True non-streaming response
   if (!stream) {
     const result = await handleNonStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, reqLogger, toolNameMap, customToolNames, trackDone, appendLog });
     streamController.handleComplete();
-    return result;
+    return withEvidence(result);
   }
 
   // Streaming response
   const { onStreamComplete, streamDetailId } = buildOnStreamComplete({ ...sharedCtx });
-  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, userAgent, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, credentials });
+  return withEvidence(await handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, userAgent, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, credentials }));
 }
 
 export function isTokenExpiringSoon(expiresAt, bufferMs = 5 * 60 * 1000) {

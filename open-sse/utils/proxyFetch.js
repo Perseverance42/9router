@@ -1,4 +1,5 @@
 import { Readable } from "stream";
+import { assertRouteweaveDispatch } from "../services/routeweaveRoute.js";
 import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
 import { dbg } from "./debugLog.js";
 
@@ -257,6 +258,7 @@ async function fetchWithTlsFallback(url, options, proxyUrl) {
     // Keep proxy/no-proxy resolution and strict-proxy enforcement here.
     if (!proxyUrl && options.directFetch) return await options.directFetch(url, options);
     const dispatcher = proxyUrl ? await getDispatcher(proxyUrl) : undefined;
+    assertRouteweaveDispatch(options.routeweaveExpiresAt, options.signal);
     return await originalFetch(url, dispatcher ? { ...options, dispatcher } : options);
   } catch (err) {
     const isStrictSsl = options.strictTls === true || process.env.STRICT_SSL === "true" || process.env.STRICT_SSL === "1";
@@ -267,6 +269,7 @@ async function fetchWithTlsFallback(url, options, proxyUrl) {
       // ponytail: in-memory insecure agent fallback for self-signed MITM corporate/antivirus certs
       console.warn(`[ProxyFetch] TLS cert verification failed (${err.cause?.code || err.code}), retrying with insecure TLS: ${url}`);
       const insecureDispatcher = await getDispatcher(proxyUrl, true);
+      assertRouteweaveDispatch(options.routeweaveExpiresAt, options.signal);
       return await originalFetch(url, { ...options, dispatcher: insecureDispatcher });
     }
     throw err;
@@ -347,6 +350,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
       "x-relay-target": `${parsed.protocol}//${parsed.host}`,
       "x-relay-path": `${parsed.pathname}${parsed.search}`,
     };
+    assertRouteweaveDispatch(options.routeweaveExpiresAt, options.signal);
     return originalFetch(vercelRelayUrl, { ...options, headers: relayHeaders });
   }
 
@@ -355,6 +359,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const proxyUrl = connectionProxyUrl || envProxyUrl;
 
   // MITM DNS bypass: for known MITM-intercepted hosts, resolve real IP to avoid DNS spoof
+  if (options.routeweaveExpiresAt != null && shouldBypassMitmDns(targetUrl)) throw Error("RouteWeave excludes DNS bypass transport");
   if (shouldBypassMitmDns(targetUrl)) {
     if (proxyUrl) {
       // Proxy resolves DNS externally (not affected by /etc/hosts) — use proxy directly

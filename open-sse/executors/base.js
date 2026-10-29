@@ -1,3 +1,5 @@
+import { setTimeout as delay } from "node:timers/promises";
+import { assertRouteweaveDispatch } from "../services/routeweaveRoute.js";
 import { HTTP_STATUS, RETRY_CONFIG, DEFAULT_RETRY_CONFIG, resolveRetryEntry, FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import { shouldRefreshCredentials } from "../services/oauthCredentialManager.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
@@ -97,7 +99,7 @@ export class BaseExecutor {
     return { status: response.status, message: bodyText || `HTTP ${response.status}` };
   }
 
-  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null, providerOverrides = null }) {
+  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null, providerOverrides = null, routeweaveExpiresAt = null }) {
     const fallbackCount = this.getFallbackCount();
     let lastError = null;
     let lastStatus = 0;
@@ -120,11 +122,16 @@ export class BaseExecutor {
       }
       retryAttemptsByUrl[urlIndex]++;
       log?.debug?.("RETRY", `${reason} retry ${retryAttemptsByUrl[urlIndex]}/${attempts} after ${waitMs / 1000}s`);
-      await new Promise(resolve => setTimeout(resolve, waitMs));
+      await response?.body?.cancel().catch(() => {});
+      assertRouteweaveDispatch(routeweaveExpiresAt, signal);
+      const waitSignal = routeweaveExpiresAt == null ? signal : AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(Math.max(1, routeweaveExpiresAt - Date.now()))]);
+      await delay(waitMs, undefined, { signal: waitSignal });
+      assertRouteweaveDispatch(routeweaveExpiresAt, signal);
       return true;
     };
 
     for (let urlIndex = 0; urlIndex < fallbackCount; urlIndex++) {
+      assertRouteweaveDispatch(routeweaveExpiresAt, signal);
       const url = this.buildUrl(model, stream, urlIndex, credentials);
       const transformedBody = this.transformRequest(model, body, stream, credentials);
       const headers = this.buildHeaders(credentials, stream, url, model, transformedBody);
@@ -143,13 +150,19 @@ export class BaseExecutor {
         const bodyStr = JSON.stringify(transformedBody);
         const fetchT0 = Date.now();
         dbg("FETCH", `${this.provider.toUpperCase()} → ${url} | body=${bodyStr.length}B | connectTimeout=${timeoutMs}ms`);
+        assertRouteweaveDispatch(routeweaveExpiresAt, signal);
         const response = await proxyAwareFetch(url, {
           method: "POST",
           headers,
           body: bodyStr,
-          signal: mergedSignal
+          signal: mergedSignal,
+          routeweaveExpiresAt,
         }, proxyOptions);
         clearTimeout(connectTimer);
+        if (signal?.aborted) {
+          await response.body?.cancel().catch(() => {});
+          signal.throwIfAborted();
+        }
         const ct = response.headers?.get?.("content-type") || "";
         const cl = response.headers?.get?.("content-length") || "?";
         dbg("FETCH", `${this.provider.toUpperCase()} ← ${response.status} | ttft=${Date.now() - fetchT0}ms | ct=${ct} | cl=${cl}`);
@@ -159,12 +172,14 @@ export class BaseExecutor {
         if (this.shouldRetry(response.status, urlIndex)) {
           log?.debug?.("RETRY", `${response.status} on ${url}, trying fallback ${urlIndex + 1}`);
           lastStatus = response.status;
+          await response.body?.cancel().catch(() => {});
           continue;
         }
 
         return { response, url, headers, transformedBody };
       } catch (error) {
         clearTimeout(connectTimer);
+        assertRouteweaveDispatch(routeweaveExpiresAt, signal);
         lastError = error;
         const isConnectTimeout = connectCtrl.signal.aborted && error.name === "AbortError";
         dbg("FETCH", `${this.provider.toUpperCase()} ✖ ${error.name}: ${error.message}${isConnectTimeout ? " (connect timeout)" : ""}`);
