@@ -90,7 +90,7 @@ function array(value, path) {
   return Array.from(value);
 }
 
-export function resolveFusionPolicy(models, tuning = {}) {
+export function resolveFusionPolicy(models, tuning = {}, consultToolName = FUSION_TOOL_NAME) {
   if (!Array.isArray(models)) {
     throw new Error("Fusion requires a model list");
   }
@@ -114,9 +114,9 @@ export function resolveFusionPolicy(models, tuning = {}) {
       ? "A direct answer or application tool call without panel consultation is permitted."
       : `Consult at least ${minPanels} panel slots before answering or calling application tools; a direct path without consultation is not permitted.`,
     maxPanels === 0
-      ? `Do not invoke ${FUSION_TOOL_NAME}; use the direct path.`
-      : `If consulting, invoke ${FUSION_TOOL_NAME} exactly once with all selected panel_ids and a nonempty brief; all selected slots run in parallel.`,
-    `Do not mix ${FUSION_TOOL_NAME} with application tool calls in the same turn.`,
+      ? `Do not invoke ${consultToolName}; use the direct path.`
+      : `If consulting, invoke ${consultToolName} exactly once with all selected panel_ids and a nonempty brief; all selected slots run in parallel.`,
+    `Do not mix ${consultToolName} with application tool calls in the same turn.`,
   ].join("\n");
   return { slots, minPanels, maxPanels, instructions };
 }

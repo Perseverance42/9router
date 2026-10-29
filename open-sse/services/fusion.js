@@ -49,7 +49,7 @@ function addInstruction(request, content) {
 }
 
 // The public request stays untouched; translator normalization receives a private copy.
-function canonicalRequest(body, sourceFormat) {
+function canonicalRequest(body, sourceFormat, internal) {
   if (body.previous_response_id) throw new FusionError("Fusion requires explicit conversation history", "preflight", {}, 400);
   if (sourceFormat === FORMATS.OPENAI_RESPONSES && body.tools?.some((tool) => tool.type !== "function")) {
     throw new FusionError("Fusion does not support Responses hosted/custom tools yet", "preflight", {}, 400);
@@ -107,7 +107,7 @@ function canonicalRequest(body, sourceFormat) {
     throw new FusionError("Fusion currently supports JSON function tools only", "preflight", {}, 400);
   }
   const names = tools.map(toolName);
-  if (new Set(names).size !== names.length || names.includes(FUSION_TOOL_NAME)) {
+  if (new Set(names).size !== names.length || (!internal && names.includes(FUSION_TOOL_NAME))) {
     throw new FusionError("Duplicate or reserved Fusion tool name", "preflight", {}, 400);
   }
   return canonical;
@@ -162,7 +162,7 @@ function anonymize(responses) {
 }
 
 /** One bounded consultation: initial controller, parallel panel, analyst, native synthesis. */
-export async function handleFusionChat({ body, models, handleSingleModel, log, judgeModel, tuning, signal, sourceFormat = detectFormat(body), preflight }) {
+export async function handleFusionChat({ body, models, handleSingleModel, log, judgeModel, tuning, signal, sourceFormat = detectFormat(body), outputFormat = sourceFormat, internal = false, preflight }) {
   const controller = new AbortController();
   const onAbort = () => controller.abort(signal.reason);
   if (signal?.aborted) onAbort();
@@ -199,13 +199,16 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
   };
   try {
     checkAbort();
-    const policy = resolveFusionPolicy(models, tuning);
-    const judge = judgeModel?.trim() || models[0];
-    if (!judge) throw new FusionError("Fusion requires an explicit judge when no panels are configured", stage, {}, 400);
     if (![FORMATS.OPENAI, FORMATS.CLAUDE, FORMATS.OPENAI_RESPONSES].includes(sourceFormat)) {
       throw new FusionError(`Unsupported Fusion client format: ${sourceFormat}`, stage, {}, 400);
     }
-    const original = canonicalRequest(body, sourceFormat);
+    const original = canonicalRequest(body, sourceFormat, internal);
+    const publicNames = new Set((original.tools || []).map(toolName));
+    let consultToolName = FUSION_TOOL_NAME;
+    while (publicNames.has(consultToolName)) consultToolName += "_internal";
+    const policy = resolveFusionPolicy(models, tuning, consultToolName);
+    const judge = judgeModel?.trim() || models[0];
+    if (!judge) throw new FusionError("Fusion requires an explicit judge when no panels are configured", stage, {}, 400);
     const publicTools = original.tools || [];
     const validators = await toolValidators(publicTools);
     const answerFormat = original.response_format;
@@ -235,26 +238,26 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
     initial.tools = [...publicTools];
     if (policy.maxPanels > 0) initial.tools.push({
       type: "function", function: {
-        name: FUSION_TOOL_NAME,
+        name: consultToolName,
         description: "Consult selected panel models concurrently in one batch. Supply all selected IDs and a self-contained task brief.",
         parameters: FUSION_CONSULT_PARAMETERS,
       },
     });
     initial.tool_choice = policy.minPanels > 0
-      ? { type: "function", function: { name: FUSION_TOOL_NAME } }
+      ? { type: "function", function: { name: consultToolName } }
       : (policy.maxPanels === 0 ? original.tool_choice : "auto");
     if (policy.maxPanels > 0) delete initial.response_format;
     stage = "initial";
     const first = await complete(initial, judge, stage);
     if (["length", "max_tokens"].includes(first.choices[0].finish_reason)) throw new FusionError("Initial judge completion was truncated", stage);
     const calls = first.choices[0].message.tool_calls || [];
-    const consultations = calls.filter((call) => call.function?.name === FUSION_TOOL_NAME);
+    const consultations = calls.filter((call) => call.function?.name === consultToolName);
     if (!consultations.length) {
       if (policy.minPanels > 0) throw new FusionError("Judge skipped required panel consultation", stage);
       // Direct handling must obey the original public contract, not internal auto choice.
       validatePublicAction(first, original, validators);
       validateAnswer(first);
-      return deliverFusionCompletion(first, { sourceFormat, stream: body.stream === true, includeUsage: body.stream_options?.include_usage === true });
+      return deliverFusionCompletion(first, { sourceFormat: outputFormat, stream: body.stream === true, includeUsage: body.stream_options?.include_usage === true });
     }
     if (consultations.length !== 1 || calls.length !== 1) throw new FusionError("Consultation must be one call without application calls", stage);
     let args;
@@ -319,14 +322,14 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
         }
         throw error;
       }
-      return deliverFusionCompletion(completion, { sourceFormat, stream: body.stream === true, includeUsage: body.stream_options?.include_usage === true });
+      return deliverFusionCompletion(completion, { sourceFormat: outputFormat, stream: body.stream === true, includeUsage: body.stream_options?.include_usage === true });
     }
-    const response = await invoke(synthesis, judge, stage, sourceFormat);
+    const response = await invoke(synthesis, judge, stage, outputFormat);
     handedOff = true;
     // ponytail: streamed text/schema correctness is provider-enforced; buffer the
     // final completion when full precommit answer validation becomes necessary.
     return guardFusionStream(response, {
-      sourceFormat, signal: controller.signal,
+      sourceFormat: outputFormat, signal: controller.signal,
       validate: (completion) => validatePublicAction(completion, original, validators, stage),
       abort: (reason) => controller.abort(reason),
       detach: () => signal?.removeEventListener("abort", onAbort),

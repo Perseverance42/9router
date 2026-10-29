@@ -122,7 +122,7 @@ export async function handleChat(request, clientRawRequest = null) {
       return handleFusionChat({
         body,
         models: comboModels,
-        ...fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels),
+        ...fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels, { comboPath: [modelStr] }),
         log,
         comboName: modelStr,
         judgeModel: comboStrategies[modelStr]?.judgeModel,
@@ -181,29 +181,49 @@ export async function handleChat(request, clientRawRequest = null) {
   return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null);
 }
 
-function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels) {
+function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels, execution = {}) {
+  const signal = execution.signal || request?.signal;
   return {
-    signal: request?.signal,
-    sourceFormat: request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) || undefined : undefined,
-    preflight: async (models, canonical) => {
+    signal,
+    sourceFormat: execution.sourceFormat || (request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) || undefined : undefined),
+    outputFormat: execution.outputFormat,
+    internal: execution.internal,
+    // The outer Fusion checks the entire reachable graph, including nested judges,
+    // before dispatch. Runtime routing keeps each combo as one logical target.
+    preflight: execution.internal ? undefined : async (models, canonical) => {
       const required = detectRequiredCapabilities(canonical);
-      for (const target of models) {
-        // A combo grants its members, not an independently configured judge.
-        if (!comboModels.includes(target)) {
-          const denied = await enforceKeyAccess(keyAccess, target);
-          if (denied) return denied;
+      const settings = await getSettings();
+      const visit = async (targets, members, path) => {
+        for (const target of targets) {
+          signal?.throwIfAborted();
+          // A combo grants its members, not an independently configured judge.
+          if (!members.includes(target)) {
+            const denied = await enforceKeyAccess(keyAccess, target);
+            if (denied) return denied;
+          }
+          const info = await getModelInfo(target);
+          if (!info.provider) {
+            const children = await getComboModels(target, { allowEmpty: true });
+            if (!children) throw new Error(`Invalid Fusion target: ${target}`);
+            if (path.includes(target) || path.length >= 32) throw new Error(`Cyclic or too deeply nested combo: ${target}`);
+            const cfg = settings.comboStrategies?.[target] || {};
+            const strategy = cfg.fallbackStrategy || settings.comboStrategy || "fallback";
+            const judge = strategy === "fusion" ? cfg.judgeModel?.trim() || children[0] : null;
+            const denied = await visit([...new Set([...children, ...(judge ? [judge] : [])])], children, [...path, target]);
+            if (denied) return denied;
+          } else {
+            const caps = getCapabilitiesForModel(info.provider, info.model);
+            for (const capability of ["vision", "pdf", "audioInput", "videoInput"]) {
+              if (required.has(capability) && !caps[capability]) throw new Error(`Fusion target ${target} lacks ${capability}`);
+            }
+          }
         }
-        const info = await getModelInfo(target);
-        if (!info.provider) throw new Error(`Nested combo is not supported in Fusion: ${target}`);
-        const caps = getCapabilitiesForModel(info.provider, info.model);
-        for (const capability of ["vision", "pdf", "audioInput", "videoInput"]) {
-          if (required.has(capability) && !caps[capability]) throw new Error(`Fusion target ${target} lacks ${capability}`);
-        }
-      }
+      };
+      return visit(models, comboModels, execution.comboPath || []);
     },
-    handleSingleModel: (b, m, execution) => handleSingleModelChat(
+    handleSingleModel: (b, m, stageExecution) => handleSingleModelChat(
       b, m, { endpoint: clientRawRequest?.endpoint, headers: { ...clientRawRequest?.headers }, body: structuredClone(b) },
-      request, apiKey, null, execution,
+      request, apiKey, null, { ...execution, ...stageExecution },
     ),
   };
 }
@@ -219,7 +239,9 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   if (!modelInfo.provider) {
     const comboModels = await getComboModels(modelStr, { allowEmpty: true });
     if (comboModels) {
-      if (execution.internal) return errorResponse(400, "Nested combos are not supported in Fusion stages");
+      const path = execution.comboPath || [];
+      if (path.includes(modelStr) || path.length >= 32) return errorResponse(400, `Cyclic or too deeply nested combo: ${modelStr}`);
+      execution = { ...execution, comboPath: [...path, modelStr] };
       const chatSettings = await getSettings();
       // Check for combo-specific strategy first, fallback to global
       const comboStrategies = chatSettings.comboStrategies || {};
@@ -229,7 +251,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       // Nested combo (a combo member that is itself a combo): the access decision
       // was made on the outer target; only drop adapter models the key may not call.
       const keyAccess = await getKeyAccessContext(request);
-      const augmentedModels = await filterAdapterModels(keyAccess, augmentModelsWithCapacityAdapter(comboModels, requiredCapabilities, chatSettings), comboModels);
+      const augmentedModels = execution.internal ? comboModels : await filterAdapterModels(keyAccess, augmentModelsWithCapacityAdapter(comboModels, requiredCapabilities, chatSettings), comboModels);
       const adapterAdded = augmentedModels.filter((m) => !comboModels.includes(m));
 
       if (comboStrategy === "fusion") {
@@ -237,7 +259,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         return handleFusionChat({
           body,
           models: comboModels,
-          ...fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels),
+          ...fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels, execution),
           log,
           comboName: modelStr,
           judgeModel: comboStrategies[modelStr]?.judgeModel,
@@ -254,9 +276,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         body,
         models: augmentedModels,
         handleSingleModel: withCapacityAdapterStripping(
-          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, execution),
           adapterAdded
         ),
+        autoSwitch: !execution.internal,
         log,
         comboName: modelStr,
         comboStrategy,

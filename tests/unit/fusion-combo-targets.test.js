@@ -1,0 +1,183 @@
+import { beforeEach, expect, it, vi } from "vitest";
+
+const fx = vi.hoisted(() => ({ combos: [], settings: {}, keys: {} }));
+const mocks = vi.hoisted(() => ({ core: vi.fn(), credentials: vi.fn(), refresh: vi.fn() }));
+vi.mock("@/lib/localDb", () => ({
+  getSettings: async () => fx.settings,
+  getModelAliases: async () => ({}),
+  getComboByName: async (name) => fx.combos.find((c) => c.name === name) || null,
+  getProviderNodes: async () => [],
+  getCombos: async () => fx.combos,
+  getCustomModels: async () => [],
+}));
+vi.mock("@/lib/db/repos/apiKeysRepo.js", () => ({ getApiKeyByKey: async (k) => fx.keys[k] }));
+vi.mock("@/lib/db/repos/combosRepo.js", () => ({ getCombos: async () => fx.combos }));
+vi.mock("@/sse/services/auth.js", () => ({
+  getProviderCredentials: mocks.credentials,
+  markAccountUnavailable: async () => ({ shouldFallback: false }),
+  clearAccountError() {}, extractApiKey: () => "key", isValidApiKey: async () => true,
+}));
+vi.mock("@/sse/services/tokenRefresh.js", () => ({
+  checkAndRefreshToken: mocks.refresh, updateProviderCredentials: vi.fn(),
+}));
+vi.mock("open-sse/handlers/chatCore.js", () => ({ handleChatCore: mocks.core }));
+
+const { handleChat } = await import("../../src/sse/handlers/chat.js");
+const { resetComboRotation } = await import("../../open-sse/services/combo.js");
+const { deliverFusionCompletion } = await import("../../open-sse/services/fusionOutput.js");
+const completion = (message) => Response.json({
+  id: "chatcmpl-test", model: "test", object: "chat.completion", created: 1,
+  choices: [{ index: 0, message: { role: "assistant", ...message }, finish_reason: message.tool_calls ? "tool_calls" : "stop" }],
+});
+const consult = (name = "consult_panel") => completion({ tool_calls: [{
+  id: "consult", type: "function", function: { name, arguments: JSON.stringify({ panel_ids: ["panel_1"], brief: "Inspect the task" }) },
+}] });
+const analysis = { consensus: [], contradictions: [], partial_coverage: [], unique_insights: [], blind_spots: [], verification_needed: [], usable_response_ids: ["response_1"] };
+const add = (name, models, cfg = {}) => {
+  fx.combos.push({ name, models });
+  fx.settings.comboStrategies[name] = cfg;
+};
+const chat = (patch = {}, signal, endpoint = "/v1/chat/completions") => handleChat(new Request(`http://localhost${endpoint}`, {
+  method: "POST", signal, headers: { "Content-Type": "application/json", Authorization: "Bearer key" },
+  body: JSON.stringify({ model: "Main", messages: [{ role: "user", content: "Question" }], ...patch }),
+}));
+const modelsCalled = () => mocks.core.mock.calls.map(([x]) => x.modelInfo.model);
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  resetComboRotation();
+  fx.combos = [];
+  fx.keys = { key: { isActive: true, access: { restricted: false, allow: [] } } };
+  fx.settings = { comboStrategy: "fallback", comboStrategies: {},
+    cavemanEnabled: true, headroomEnabled: true, rtkEnabled: true, customPromptEnabled: true };
+  mocks.credentials.mockResolvedValue({ connectionId: "connection" });
+  mocks.refresh.mockImplementation(async (_p, c) => c);
+  mocks.core.mockImplementation(async ({ body, modelInfo }) => {
+    if (modelInfo.model.endsWith("bad")) return { success: false, response: new Response("failed", { status: 500 }) };
+    let response;
+    if (body.response_format?.json_schema?.name === "fusion_analysis") response = completion({ content: JSON.stringify(analysis) });
+    else if (body.tool_choice?.function?.name) response = consult(body.tool_choice.function.name);
+    else response = completion({ content: `Answer ${modelInfo.model}` });
+    if (body.stream) response = deliverFusionCompletion(await response.json(), { sourceFormat: "claude", stream: true });
+    return { success: true, response };
+  });
+});
+
+it.each(["fallback", "round-robin"])("keeps a combo panel as one slot with its %s strategy", async (strategy) => {
+  add("Main", ["Panel"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
+  add("Panel", ["openai/panel-bad", "openai/panel-good"], { fallbackStrategy: strategy });
+  expect((await chat()).status).toBe(200);
+  expect(modelsCalled()).toEqual(["judge", "panel-bad", "panel-good", "judge", "judge"]);
+  mocks.core.mockClear();
+  expect((await chat()).status).toBe(200);
+  expect(modelsCalled()).toEqual(strategy === "round-robin"
+    ? ["judge", "panel-good", "judge", "judge"]
+    : ["judge", "panel-bad", "panel-good", "judge", "judge"]);
+  const initial = mocks.core.mock.calls[0][0].body.messages[0].content;
+  expect(initial).toContain("panel_1: Panel");
+  expect(initial).not.toContain("panel_2:");
+});
+
+it.each(["fallback", "round-robin"])("routes all judge stages through its combo's %s strategy", async (strategy) => {
+  add("Main", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "Judge" });
+  add("Judge", ["openai/judge-bad", "openai/judge-good"], { fallbackStrategy: strategy });
+  expect((await chat()).status).toBe(200);
+  expect(modelsCalled()).toEqual(strategy === "round-robin"
+    ? ["judge-bad", "judge-good", "panel", "judge-good", "judge-bad", "judge-good"]
+    : ["judge-bad", "judge-good", "panel", "judge-bad", "judge-good", "judge-bad", "judge-good"]);
+});
+
+it.each(["Panel", "Judge", "NestedJudge"])("checks the weakest reachable capability in %s before any dispatch", async (weak) => {
+  add("Main", ["Panel"], { fallbackStrategy: "fusion", judgeModel: "Judge" });
+  add("Panel", ["openai/gpt-4o", ...(weak === "Panel" ? ["openai/text-only"] : [])]);
+  add("Judge", [weak === "Judge" ? "openai/text-only" : "openai/gpt-4o"], {
+    fallbackStrategy: "fusion", judgeModel: "NestedJudge",
+  });
+  add("NestedJudge", [weak === "NestedJudge" ? "openai/text-only" : "openai/gpt-4o"]);
+  // An adapter must not hide a weak included member or expand internal calls.
+  fx.settings.capacityAdapter = { vision: { enabled: true, models: ["openai/gpt-4o"] } };
+  const result = await chat({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,AA==" } }] }] });
+  expect(result.status).toBe(400);
+  expect((await result.json()).error.message).toContain("text-only lacks vision");
+  expect(mocks.credentials).not.toHaveBeenCalled();
+});
+
+it("preserves internal formats, cancellation and disabled transforms through combo fallback", async () => {
+  add("Main", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "Judge" });
+  add("Judge", ["openai/judge-bad", "openai/judge-good"]);
+  const parent = new AbortController();
+  let release;
+  const started = new Promise((r) => { release = r; });
+  const previous = mocks.core.getMockImplementation();
+  mocks.core.mockImplementation(async (options) => {
+    if (options.modelInfo.model === "judge-good") { release(); return new Promise(() => {}); }
+    return previous(options);
+  });
+  const pending = chat({}, parent.signal, "/v1/messages");
+  await started;
+  parent.abort();
+  expect((await pending).status).toBe(499);
+  expect(modelsCalled()).toEqual(["judge-bad", "judge-good"]);
+  for (const [options] of mocks.core.mock.calls) {
+    expect(options).toMatchObject({ internal: true, sourceFormatOverride: "openai", responseFormatOverride: "openai", cavemanEnabled: false, headroomEnabled: false, rtkEnabled: false, customPromptEnabled: false });
+    expect(options.externalSignal.aborted).toBe(true);
+  }
+});
+
+it.each(["panel", "judge"])("executes nested Fusion as a %s without consuming its caller's consultation tool", async (kind) => {
+  add("Main", [kind === "panel" ? "Nested" : "openai/panel"], { fallbackStrategy: "fusion", judgeModel: kind === "judge" ? "Nested" : "openai/judge" });
+  add("Nested", ["openai/inner-panel"], { fallbackStrategy: "fusion", judgeModel: "openai/inner-judge" });
+  const result = await chat();
+  expect(result.status).toBe(200);
+  expect((await result.json()).choices[0].message.content).toContain("Answer");
+  const inner = mocks.core.mock.calls.map(([x]) => x).filter((x) => x.modelInfo.model === "inner-judge");
+  if (kind === "judge") {
+    expect(inner[0].body.tools.map((t) => t.function.name)).toEqual(["consult_panel", "consult_panel_internal"]);
+    expect(inner[0].body.messages[0].content).toContain("invoke consult_panel_internal exactly once");
+    expect(inner[0].body.tool_choice.function.name).toBe("consult_panel_internal");
+    expect(inner[2].body.tool_choice.function.name).toBe("consult_panel");
+  }
+});
+
+it("preserves Claude streaming output through a nested Fusion judge", async () => {
+  add("Main", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "Nested" });
+  add("Nested", ["openai/inner-panel"], { fallbackStrategy: "fusion", judgeModel: "Judge" });
+  add("Judge", ["openai/inner-judge"]);
+  const result = await chat({ stream: true }, undefined, "/v1/messages");
+  expect(result.status).toBe(200);
+  const events = await result.text();
+  expect(events).toContain("event: message_start");
+  expect(events).toContain("Answer inner-judge");
+  expect(events).toContain("event: message_stop");
+  const final = mocks.core.mock.calls.at(-1)[0];
+  expect(final).toMatchObject({ sourceFormatOverride: "openai", responseFormatOverride: "claude", internal: true });
+});
+
+it.each(["member", "judge"])("rejects a recursive %s edge in preflight", async (edge) => {
+  add("Main", ["Nested"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
+  add("Nested", edge === "member" ? ["Main"] : ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: edge === "judge" ? "Main" : "openai/judge" });
+  const result = await chat();
+  expect(result.status).toBe(400);
+  expect((await result.json()).error.message).toContain("Cyclic or too deeply nested combo: Main");
+  expect(mocks.credentials).not.toHaveBeenCalled();
+});
+
+it("bounds acyclic combo nesting before credential lookup", async () => {
+  add("Main", ["Level0"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
+  for (let i = 0; i < 32; i++) add(`Level${i}`, [i === 31 ? "openai/panel" : `Level${i + 1}`]);
+  const result = await chat();
+  expect(result.status).toBe(400);
+  expect((await result.json()).error.message).toContain("too deeply nested combo");
+  expect(mocks.credentials).not.toHaveBeenCalled();
+});
+
+it("requires access to nested external judges but grants combo members", async () => {
+  add("Main", ["Nested"], { fallbackStrategy: "fusion", judgeModel: "Nested" });
+  add("Nested", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "Judge" });
+  add("Judge", ["openai/judge"]);
+  fx.keys.key.access = { restricted: true, allow: ["Main"] };
+  expect((await chat()).status).toBe(403);
+  expect(mocks.credentials).not.toHaveBeenCalled();
+  fx.keys.key.access.allow.push("Judge");
+  expect((await chat()).status).toBe(200);
+});
