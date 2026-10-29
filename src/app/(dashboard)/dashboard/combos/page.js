@@ -52,6 +52,7 @@ const STRATEGY_OPTIONS = [
   { value: "round-robin", label: "Round Robin — rotate" },
   { value: "smart", label: "Smart Router — System One" },
   { value: "fusion", label: "Fusion — panel + judge" },
+  { value: "routeweave", label: "RouteWeave — private backend" },
 ];
 
 function getPolicyBadgeLabel(strategy = {}) {
@@ -713,6 +714,12 @@ function ComboCard({ combo, getCaps, comboByName = {}, activeProviders = [], cop
                 <span className="opacity-40">·</span>
                 <span>max {fmtK(comboCaps.maxOutput)}</span>
               </div>
+            )}
+            {current === "routeweave" && (
+              <p className="mt-2 text-[11px] text-text-muted">
+                Requires a private backend configured in server environment variables. Plain text only; flat canonical OpenAI/Anthropic targets, no nested candidate combos.
+                {" "}Mode is server-configured (default active_required). Shadow uses admitted original order, not Smart Router.
+              </p>
             )}
             {/* Fusion: judge picker (Auto = first model) */}
             {isFusion && (

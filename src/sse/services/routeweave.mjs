@@ -20,14 +20,24 @@ function failure(message, status = 503) {
   return Response.json({ error: { type: "routeweave_error", message } }, { status });
 }
 
-export function readRouteweaveConfig(comboName, env = process.env) {
-  if (!(env.ROUTEWEAVE_COMBOS || "").split(",").map(s => s.trim()).includes(comboName)) return null;
+// Called only after resolving the saved per-combo RouteWeave strategy.
+export function readRouteweaveConfig(env = process.env) {
   const url = new URL(env.ROUTEWEAVE_URL);
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error("Invalid RouteWeave URL");
-  if (!MODES.has(env.ROUTEWEAVE_MODE) || !env.ROUTEWEAVE_SERVICE_TOKEN) throw Error("Missing RouteWeave mode or service token");
+  const mode = env.ROUTEWEAVE_MODE || "active_required";
+  if (!MODES.has(mode) || typeof env.ROUTEWEAVE_SERVICE_TOKEN !== "string" || !/^[\x21-\x7e]+$/.test(env.ROUTEWEAVE_SERVICE_TOKEN)) throw Error("Missing RouteWeave mode or service token");
   const allowlist = JSON.parse(env.ROUTEWEAVE_ALLOWLIST || "null");
   if (!allowlist || typeof allowlist !== "object" || Array.isArray(allowlist)) throw Error("Missing authoritative RouteWeave allowlist");
-  return { url: url.href.replace(/\/$/, ""), token: env.ROUTEWEAVE_SERVICE_TOKEN, mode: env.ROUTEWEAVE_MODE, allowlist, decisionTimeoutMs: decisionTimeout(env.ROUTEWEAVE_DECISION_TIMEOUT_MS) };
+  return { url: url.href.replace(/\/$/, ""), token: env.ROUTEWEAVE_SERVICE_TOKEN, mode, allowlist, decisionTimeoutMs: decisionTimeout(env.ROUTEWEAVE_DECISION_TIMEOUT_MS) };
+}
+
+export function assertRouteweaveTransforms(settings, headers, provider) {
+  const flags = ["rtkEnabled", "headroomEnabled", "cavemanEnabled", "ponytailEnabled"].map(key => settings[key]);
+  const optOut = headers?.get?.("x-9router-token-saver")?.toLowerCase() === "off" ||
+    Object.entries(headers || {}).some(([k, v]) => k.toLowerCase() === "x-9router-token-saver" && typeof v === "string" && v.toLowerCase() === "off");
+  const thinkingMode = settings.providerThinking?.[provider]?.mode;
+  if ((!optOut && flags.some(Boolean)) || settings.customPromptEnabled || settings.pxpipeEnabled || (thinkingMode && thinkingMode !== "auto"))
+    throw Error("RouteWeave requires untransformed requests; disable effective token savers, custom prompt, PXPIPE and thinking for its candidates");
 }
 
 // Deliberately closed request vocabulary: unknown workflow extensions must not become text classifications.
@@ -73,33 +83,45 @@ export function admitModels(body, models, allowlist) {
   return { models: admitted, input, output };
 }
 
-async function readBounded(response, limit = MAX_BYTES) {
+async function abortable(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) { Promise.resolve(promise).catch(() => {}); throw signal.reason; }
+  let abort;
+  try { return await Promise.race([promise, new Promise((_, reject) => {
+    abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  })]); } finally { signal.removeEventListener("abort", abort); }
+}
+
+async function readBounded(response, signal, limit = MAX_BYTES) {
   if (!response.body) throw Error("Empty RouteWeave response");
   const reader = response.body.getReader();
   const chunks = [];
   let size = 0;
   try {
     while (true) {
-      const { value, done } = await reader.read();
+      const { value, done } = await abortable(reader.read(), signal);
       if (done) break;
       size += value.byteLength;
       if (size > limit) throw Error("RouteWeave response too large");
       chunks.push(value);
     }
-  } catch (error) { await reader.cancel().catch(() => {}); throw error; }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch (error) { void reader.cancel().catch(() => {}); throw error; }
+  finally { reader.releaseLock(); }
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
 }
 
 export function validateDecision(d, request, now = Date.now()) {
   const ids = request.candidates.map(c => c.id);
-  const order = d?.ranking?.map(r => r.candidate_id);
+  const order = Array.isArray(d?.ranking) ? d.ranking.map(r => r?.candidate_id) : null;
   const expiry = Date.parse(d?.expires_at);
   if (d?.request_id !== request.request_id || d?.mode !== request.mode || d?.candidate_snapshot_id !== request.candidate_snapshot_id || typeof d?.decision_id !== "string" || !d.decision_id.length || d.decision_id.length > 256 || typeof d.policy_revision !== "string" || !d.policy_revision.length || d.status !== "ranked" || !Number.isFinite(expiry) || expiry <= now || expiry > now + 60_000 || !Array.isArray(order) || order.length !== ids.length || new Set(order).size !== ids.length || order.some(id => !ids.includes(id)) || d.ranking.some(r => !Number.isFinite(r.score))) throw Error("Invalid or expired RouteWeave decision");
   return order;
 }
 
 function post(config, endpoint, payload, signal, fetchImpl) {
-  return fetchImpl(`${config.url}/v1/${endpoint}`, { method: "POST", redirect: "error", headers: { "content-type": "application/json", authorization: `Bearer ${config.token}` }, body: JSON.stringify(payload), signal });
+  return fetchImpl(`${config.url}/v1/${endpoint}`, { method: "POST", redirect: "error", strictTls: true, routeweave: true, headers: { "content-type": "application/json", authorization: `Bearer ${config.token}` }, body: JSON.stringify(payload), signal });
 }
 
 function feedback(config, payload, fetchImpl) {
@@ -118,24 +140,33 @@ export async function handleRouteweaveCombo({ config, body, models, signal, nati
   try {
     messages = normalizeText(body);
     pool = admitModels(body, models, config.allowlist);
-    for (const id of models) {
+    for (const id of pool.models) {
       if (typeof id !== "string" || /\([^()]+\)\s*$/.test(id)) throw Error("RouteWeave excludes thinking suffixes");
       const resolved = await resolveModel(id);
       if (typeof id !== "string" || !id.includes("/") || !resolved?.provider) throw Error("RouteWeave requires flat concrete model routes");
       assertRouteweaveRoute(resolved, null, body);
     }
-    if (nativeOptions.comboStrategy === "fusion") throw Error("RouteWeave does not support fusion");
-  } catch (e) { return failure(e.message, 422); }
+    signal?.throwIfAborted();
+  } catch (e) { return signal?.aborted ? failure("RouteWeave request cancelled", 499) : failure(e.message, 422); }
   const payload = { request_id: randomUUID(), mode: config.mode, context: { messages, hints: { input_modalities: ["text"], output_modalities: ["text"], tools_present: false } }, requirements: { estimated_input_tokens: pool.input, reserved_output_tokens: pool.output, required_features: [], continuity: "unlocked" }, candidate_snapshot_id: randomUUID(), candidates: pool.models.map(id => ({ id })) };
   let decision = null, order = pool.models;
   try {
-    const timeout = AbortSignal.timeout(decisionTimeout(config.decisionTimeoutMs));
-    const r = await post(config, "decisions", payload, signal ? AbortSignal.any([signal, timeout]) : timeout, fetchImpl);
-    if (!r.ok) { await r.body?.cancel(); throw Error("RouteWeave unavailable"); }
-    const d = await readBounded(r);
-    order = validateDecision(d, payload);
+    const budget = decisionTimeout(config.decisionTimeoutMs);
+    const deadline = performance.now() + budget;
+    const timeout = AbortSignal.timeout(budget);
+    const decisionSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const pending = post(config, "decisions", payload, decisionSignal, fetchImpl);
+    pending.then(r => { if (decisionSignal.aborted) void r.body?.cancel().catch(() => {}); }, () => {});
+    const r = await abortable(pending, decisionSignal);
+    if (!r.ok) { void r.body?.cancel().catch(() => {}); throw Error("RouteWeave unavailable"); }
+    const d = await readBounded(r, decisionSignal);
+    const ranking = validateDecision(d, payload);
+    decisionSignal.throwIfAborted();
+    if (performance.now() >= deadline) throw Error("RouteWeave decision timed out");
+    order = ranking;
     decision = d;
   } catch {
+    if (signal?.aborted) return failure("RouteWeave request cancelled", 499);
     console.warn("RouteWeave decision unavailable or invalid");
     if (config.mode === "active_required") return failure("RouteWeave decision unavailable or invalid");
   }
@@ -155,7 +186,7 @@ export async function handleRouteweaveCombo({ config, body, models, signal, nati
   try {
     const external = config.mode !== "shadow";
     // Advisory failures stay within the admitted pool and never invoke the native paid smart classifier.
-    const response = await runCombo({ ...nativeOptions, body, signal, routeweave: true, models: external ? order : pool.models, ...(external ? { externalOrder: true, autoSwitch: false, sessionId: null, resolveSmartChoice: null } : {}), onSelected: id => { selected = id; }, handleSingleModel: async (b, id) => {
+    const response = await runCombo({ ...nativeOptions, body, signal, routeweave: true, models: external ? order : pool.models, comboStrategy: "fallback", externalOrder: true, autoSwitch: false, sessionId: null, resolveSmartChoice: null, onSelected: id => { selected = id; }, handleSingleModel: async (b, id) => {
       if (signal?.aborted) throw Error("Request cancelled");
       if (!pool.models.includes(id) || attempts.length >= MAX_CANDIDATES) throw Error("RouteWeave dispatch outside admitted pool");
       if (decision && config.mode !== "shadow" && Date.parse(decision.expires_at) <= Date.now()) throw Error("RouteWeave decision expired before dispatch");
@@ -174,5 +205,5 @@ export async function handleRouteweaveCombo({ config, body, models, signal, nati
       }
     } });
     return observeResponse(response, signal, report);
-  } catch { report(signal?.aborted ? "cancelled" : attempts.length ? "failed" : "not_executed"); return failure("RouteWeave completion failed"); }
+  } catch { report(signal?.aborted ? "cancelled" : attempts.length ? "failed" : "not_executed"); return failure(signal?.aborted ? "RouteWeave request cancelled" : "RouteWeave completion failed", signal?.aborted ? 499 : 503); }
 }

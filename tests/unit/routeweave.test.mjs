@@ -5,11 +5,17 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { readRouteweaveConfig, normalizeText, admitModels, validateDecision, observeResponse, handleRouteweaveCombo } from "../../src/sse/services/routeweave.mjs";
-import { handleComboChat } from "../../open-sse/services/combo.js";
-import { createStreamController } from "../../open-sse/utils/streamHandler.js";
-import { assertRouteweaveRoute } from "../../open-sse/services/routeweaveRoute.js";
-import { handleSystemoneCore } from "../../open-sse/handlers/systemoneCore.js";
+import { registerHooks } from "node:module";
+registerHooks({ resolve(specifier, context, next) {
+  if (specifier.startsWith("@/")) return next(new URL("../../src/" + specifier.slice(2) + (specifier.endsWith(".js") ? "" : ".js"), import.meta.url).href, context);
+  if (specifier.startsWith("open-sse/")) return next(new URL("../../open-sse/" + specifier.slice(9), import.meta.url).href, context);
+  return next(specifier, context);
+} });
+const { readRouteweaveConfig, normalizeText, admitModels, validateDecision, observeResponse, handleRouteweaveCombo } = await import("../../src/sse/services/routeweave.mjs");
+const { handleComboChat } = await import("../../open-sse/services/combo.js");
+const { createStreamController } = await import("../../open-sse/utils/streamHandler.js");
+const { handleSystemoneCore } = await import("../../open-sse/handlers/systemoneCore.js");
+const { assertRouteweaveRoute } = await import("../../open-sse/services/routeweaveRoute.js");
 
 const models = ["openai/a", "openai/b"];
 const rule = { text: true, tokens_per_byte: 1, template_tokens: 100, context_tokens: 10000, max_output_tokens: 1000 };
@@ -25,12 +31,14 @@ function harness(mode = "active_required", override = {}) {
   const options = {
     config: { ...config, mode }, body: structuredClone(body), models,
     nativeOptions: { log, comboStrategy: "smart", comboName: "opt-in", sessionId: "native-sticky", resolveSmartChoice: () => { throw Error("paid classifier must not run"); } },
-    resolveModel: async id => ({ provider: id.split("/")[0] }),
+    resolveModel: async id => ({ provider: id.split("/")[0], model: id.split("/").slice(1).join("/") }),
     runCombo: handleComboChat,
     dispatch: async (b, id) => { dispatched.push(id); return answer(); },
     fetchImpl: async (url, init) => {
       assert.equal(init.headers.authorization, "Bearer service-only");
       assert.equal(init.redirect, "error");
+      assert.equal(init.strictTls, true);
+      assert.equal(init.routeweave, true);
       const p = JSON.parse(init.body);
       if (url.endsWith("decisions")) { payloads.push(p); return Response.json(decisionFor(p)); }
       outcomes.push(p); return Response.json({ ok: true });
@@ -39,16 +47,16 @@ function harness(mode = "active_required", override = {}) {
   return { options, dispatched, outcomes, payloads };
 }
 
-test("disabled configuration is inert; opt-in needs explicit server secrets and allowlist", () => {
-  assert.equal(readRouteweaveConfig("other", {}), null);
-  assert.throws(() => readRouteweaveConfig("opt-in", { ROUTEWEAVE_COMBOS: "opt-in" }));
-  const c = readRouteweaveConfig("opt-in", { ROUTEWEAVE_COMBOS: "opt-in", ROUTEWEAVE_URL: "http://localhost:9090", ROUTEWEAVE_MODE: "shadow", ROUTEWEAVE_SERVICE_TOKEN: "private", ROUTEWEAVE_ALLOWLIST: JSON.stringify(config.allowlist) });
+test("strategy connection configuration requires secrets and allowlist but never selects combos", () => {
+  assert.throws(() => readRouteweaveConfig({}));
+  assert.throws(() => readRouteweaveConfig({ ROUTEWEAVE_COMBOS: "opt-in" }));
+  const c = readRouteweaveConfig({ ROUTEWEAVE_URL: "http://localhost:9090", ROUTEWEAVE_MODE: "shadow", ROUTEWEAVE_SERVICE_TOKEN: "private", ROUTEWEAVE_ALLOWLIST: JSON.stringify(config.allowlist) });
   assert.equal(c.token, "private");
   assert.equal(c.decisionTimeoutMs, 35000);
   const env = { ROUTEWEAVE_COMBOS: "opt-in", ROUTEWEAVE_URL: c.url, ROUTEWEAVE_MODE: "active_required", ROUTEWEAVE_SERVICE_TOKEN: c.token, ROUTEWEAVE_ALLOWLIST: JSON.stringify(c.allowlist) };
-  for (const timeout of ["", "0", "99", "60001", "1.5", "NaN", "Infinity"]) assert.throws(() => readRouteweaveConfig("opt-in", { ...env, ROUTEWEAVE_DECISION_TIMEOUT_MS: timeout }));
-  assert.equal(readRouteweaveConfig("opt-in", { ...env, ROUTEWEAVE_DECISION_TIMEOUT_MS: "60000" }).decisionTimeoutMs, 60000);
-  assert.throws(() => readRouteweaveConfig("opt-in", { ...env, ROUTEWEAVE_MODE: "unsupported" }));
+  for (const timeout of ["", "0", "99", "60001", "1.5", "NaN", "Infinity"]) assert.throws(() => readRouteweaveConfig({ ...env, ROUTEWEAVE_DECISION_TIMEOUT_MS: timeout }));
+  assert.equal(readRouteweaveConfig({ ...env, ROUTEWEAVE_DECISION_TIMEOUT_MS: "60000" }).decisionTimeoutMs, 60000);
+  assert.throws(() => readRouteweaveConfig({ ...env, ROUTEWEAVE_MODE: "unsupported" }));
 });
 
 test("normalizes text OpenAI and Claude only; rejects tools/media/continuity/extensions", () => {
@@ -110,6 +118,39 @@ test("active_required executes external order, bypasses native smart routing and
   assert.equal(h.outcomes[0].mode, "active_required");
 });
 
+test("RouteWeave retries whitespace-only streams without changing native content rules", async () => {
+  for (const event of [
+    'data: {"choices":[{"delta":{"content":"  "}}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+    'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"  "}}\n\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\ndata: {"type":"message_stop"}\n\n',
+  ]) {
+    const h = harness();
+    h.options.dispatch = async (_b, id) => { h.dispatched.push(id); return id === models[1] ? new Response(event, { headers: { "content-type": "text/event-stream" } }) : answer(); };
+    assert.match(await (await handleRouteweaveCombo(h.options)).text(), /answer/);
+    assert.deepEqual(h.dispatched, [...models].reverse());
+    await tick();
+    assert.equal(h.outcomes[0].status, "succeeded");
+  }
+  const { peekStreamForContent } = await import("../../open-sse/services/emptyFailover.js");
+  const native = await peekStreamForContent(new Response('data: {"choices":[{"delta":{"content":" "}}]}\n\n').body);
+  assert.equal(native.outcome, "content");
+  await native.reader.cancel();
+});
+
+test("native transient cooldown accepts absent and null cancellation signals", async () => {
+  const { ERROR_RULES } = await import("../../open-sse/config/errorConfig.js");
+  ERROR_RULES.unshift({ status: 503, cooldownMs: 30 });
+  try {
+    for (const opts of [{}, { signal: null }]) {
+      let attempts = 0;
+      const start = Date.now();
+      const response = await handleComboChat({ body, models, log, ...opts, handleSingleModel: async () => ++attempts === 1 ? Response.json({ error: "busy" }, { status: 503 }) : answer() });
+      await response.text();
+      assert.equal(attempts, 2);
+      assert.ok(Date.now() - start >= 25);
+    }
+  } finally { ERROR_RULES.shift(); }
+});
+
 test("fallback and all attempts stay in admitted pool and preserve external order", async () => {
   const h = harness();
   h.options.dispatch = async (b, id) => { h.dispatched.push(id); return id === models[1] ? Response.json({ error: "unsupported parameter" }, { status: 400 }) : answer(); };
@@ -147,6 +188,38 @@ test("sidecar wait is bounded and aborts before active_required dispatch", async
   } finally { clearTimeout(keepAlive); }
 });
 
+test("late parsed decisions cannot beat a delayed timeout notification in any mode", async (t) => {
+  let elapsed = 0;
+  t.mock.method(performance, "now", () => elapsed);
+  for (const mode of ["active_required", "active_advisory", "shadow"]) {
+    elapsed = 0;
+    let timerAborted;
+    const h = harness(mode, { config: { ...config, mode, decisionTimeoutMs: 100 } });
+    h.options.fetchImpl = async (url, init) => {
+      if (url.endsWith("outcomes")) {
+        h.outcomes.push(JSON.parse(init.body));
+        return Response.json({ ok: true });
+      }
+      const decision = decisionFor(JSON.parse(init.body));
+      const json = JSON.stringify(decision);
+      // Synchronous parsing/validation may finish before the timer gets a turn.
+      return new Response(new ReadableStream({ start(controller) {
+        controller.enqueue(new TextEncoder().encode(json));
+        controller.close();
+        elapsed = 101;
+        timerAborted = init.signal.aborted;
+      } }));
+    };
+    const response = await handleRouteweaveCombo(h.options);
+    await response.text();
+    assert.equal(timerAborted, false);
+    assert.equal(response.status, mode === "active_required" ? 503 : 200);
+    assert.deepEqual(h.dispatched, mode === "active_required" ? [] : [models[0]]);
+    await tick();
+    assert.equal(h.outcomes.length, 0);
+  }
+});
+
 test("shadow records native order rather than recommendation; still hard-admitted", async () => {
   const h = harness("shadow");
   h.options.nativeOptions = { log, comboStrategy: "fallback" };
@@ -156,9 +229,9 @@ test("shadow records native order rather than recommendation; still hard-admitte
   assert.equal(h.outcomes[0].mode, "shadow");
 });
 
-test("unsupported requests, nested/fusion and invalid limits visibly fail closed in every mode", async () => {
+test("unsupported requests, nested candidates and invalid limits visibly fail closed in every mode", async () => {
   for (const mode of ["active_required", "shadow", "active_advisory"]) {
-    for (const extra of [{ body: { ...body, tools: [] } }, { nativeOptions: { log, comboStrategy: "fusion" } }, { resolveModel: async () => ({ provider: null }) }, { config: { ...config, mode, allowlist: {} } }]) {
+    for (const extra of [{ body: { ...body, tools: [] } }, { resolveModel: async () => ({ provider: null }) }, { config: { ...config, mode, allowlist: {} } }]) {
       const h = harness(mode, extra);
       const r = await handleRouteweaveCombo(h.options);
       assert.equal(r.status, 422); assert.equal(h.dispatched.length, 0); assert.equal(h.payloads.length, 0);
@@ -262,6 +335,27 @@ test("request abort cancels observed reader and tears down upstream stream", asy
   assert.equal(cancelled, true);
   assert.deepEqual(statuses, ["cancelled"]);
   assert.equal((await reader.read()).done, true);
+});
+
+test("all modes bound stalled backend bodies; cancelled required requests return499", async () => {
+  for (const mode of ["active_required", "active_advisory", "shadow"]) {
+    const h = harness(mode);
+    h.options.config = { ...h.options.config, decisionTimeoutMs: 100 };
+    let cancelled = false;
+    h.options.fetchImpl = async () => new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('{')); }, cancel() { cancelled = true; } }));
+    const start = Date.now();
+    const response = await handleRouteweaveCombo(h.options);
+    assert.equal(response.status, mode === "active_required" ? 503 : 200);
+    await response.text();
+    assert.equal(cancelled, true); assert.ok(Date.now() - start < 1500);
+    assert.equal(h.dispatched.length, mode === "active_required" ? 0 : 1);
+  }
+  const h = harness();
+  const controller = new AbortController();
+  h.options.signal = controller.signal;
+  h.options.fetchImpl = async () => { controller.abort(); return new Response('{}'); };
+  assert.equal((await handleRouteweaveCombo(h.options)).status, 499);
+  assert.equal(h.dispatched.length, 0);
 });
 
 test("feedback failure never fails completion", async () => {

@@ -94,7 +94,7 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
 /**
  * Translate non-streaming response body from provider format → OpenAI format.
  */
-export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames = null) {
+export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames = null, { routeweave = false } = {}) {
   if (targetFormat === sourceFormat) return responseBody;
   // Provider responded in OpenAI Chat Completions shape but the client speaks
   // Responses API — convert so tool_calls/text surface as Responses `output`.
@@ -202,9 +202,9 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
     if (!message.content && !message.tool_calls) message.content = "";
 
     let finishReason = responseBody.stop_reason || "stop";
-    if (finishReason === "end_turn" || finishReason === "stop_sequence") finishReason = "stop";
-    if (finishReason === "max_tokens") finishReason = "length";
-    if (finishReason === "refusal") finishReason = "content_filter";
+    if (finishReason === "end_turn" || (routeweave && finishReason === "stop_sequence")) finishReason = "stop";
+    if (routeweave && finishReason === "max_tokens") finishReason = "length";
+    if (routeweave && finishReason === "refusal") finishReason = "content_filter";
     if (finishReason === "tool_use") finishReason = "tool_calls";
 
     const result = {
@@ -236,7 +236,7 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
 /**
  * Handle non-streaming response from provider.
  */
-export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqTag, log }) {
+export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqTag, log, routeweave = false }) {
   trackDone();
   const contentType = providerResponse.headers.get("content-type") || "";
   let responseBody;
@@ -282,7 +282,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { total: Date.now() - requestStartTime } }));
 
   const translatedResponse = needsTranslation(targetFormat, sourceFormat)
-    ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames)
+    ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames, { routeweave })
     : responseBody;
   const isClaudeMessageResponse = sourceFormat === FORMATS.CLAUDE && translatedResponse?.type === "message";
   // Responses-format translation produces a `object:"response"` body with no

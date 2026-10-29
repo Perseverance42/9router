@@ -256,6 +256,7 @@ async function fetchWithTlsFallback(url, options, proxyUrl) {
   try {
     // Protocol adapters may need Node's HTTP/1 transport on the direct path.
     // Keep proxy/no-proxy resolution and strict-proxy enforcement here.
+    assertRouteweaveDispatch(options.routeweaveExpiresAt, options.signal);
     if (!proxyUrl && options.directFetch) return await options.directFetch(url, options);
     const dispatcher = proxyUrl ? await getDispatcher(proxyUrl) : undefined;
     assertRouteweaveDispatch(options.routeweaveExpiresAt, options.signal);
@@ -337,6 +338,8 @@ async function createBypassRequest(parsedUrl, realIP, options) {
 
 export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const targetUrl = typeof url === "string" ? url : url.toString();
+  assertRouteweaveDispatch(options.routeweaveExpiresAt, options.signal);
+  if ((options.routeweave || options.routeweaveExpiresAt != null) && shouldBypassMitmDns(targetUrl)) throw Error("RouteWeave excludes DNS bypass transport");
 
   // Vercel relay: forward request via relay headers
   const vercelRelayUrl = normalizeString(proxyOptions?.vercelRelayUrl);
@@ -359,7 +362,6 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const proxyUrl = connectionProxyUrl || envProxyUrl;
 
   // MITM DNS bypass: for known MITM-intercepted hosts, resolve real IP to avoid DNS spoof
-  if (options.routeweaveExpiresAt != null && shouldBypassMitmDns(targetUrl)) throw Error("RouteWeave excludes DNS bypass transport");
   if (shouldBypassMitmDns(targetUrl)) {
     if (proxyUrl) {
       // Proxy resolves DNS externally (not affected by /etc/hosts) — use proxy directly

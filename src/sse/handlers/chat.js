@@ -24,7 +24,7 @@ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import { resolveSessionIdentity } from "open-sse/utils/sessionManager.js";
 import * as log from "../utils/logger.js";
-import { readRouteweaveConfig, handleRouteweaveCombo } from "../services/routeweave.mjs";
+import { readRouteweaveConfig, handleRouteweaveCombo, assertRouteweaveTransforms } from "../services/routeweave.mjs";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
@@ -101,16 +101,6 @@ export async function handleChat(request, clientRawRequest = null) {
   const keyAccessDenied = await enforceKeyAccess(keyAccess, modelStr);
   if (keyAccessDenied) return keyAccessDenied;
 
-  let routeweave;
-  try { routeweave = readRouteweaveConfig(modelStr); } catch {
-    return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, "Invalid RouteWeave server configuration");
-  }
-
-  // Bypass naming/warmup requests before combo rotation to avoid wasting rotation slots
-  const userAgent = request?.headers?.get("user-agent") || "";
-  const bypassResponse = routeweave ? null : handleBypassRequest(body, modelStr, userAgent, !!settings.ccFilterNaming);
-  if (bypassResponse) return bypassResponse.response || bypassResponse;
-
   const requiredCapabilities = detectRequiredCapabilities(body);
 
   // Check if model is a combo (has multiple models with fallback)
@@ -119,25 +109,10 @@ export async function handleChat(request, clientRawRequest = null) {
     // Check for combo-specific strategy first, fallback to global
     const comboStrategies = settings.comboStrategies || {};
     const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
-    const comboStrategy = comboSpecificStrategy || settings.comboStrategy || "fallback";
-    if (routeweave) {
-      if (["rtkEnabled", "headroomEnabled", "cavemanEnabled", "ponytailEnabled", "customPromptEnabled", "pxpipeEnabled"].some(key => settings[key]) || Object.values(settings.providerThinking || {}).some(Boolean)) {
-        return errorResponse(422, "RouteWeave requires request transforms and thinking overrides disabled");
-      }
-      const cfg = comboStrategies[modelStr] || {};
-      return handleRouteweaveCombo({
-        config: routeweave, body, models: comboModels, signal: request.signal,
-        resolveModel: getModelInfo, runCombo: handleComboChat,
-        dispatch: (b, m, execution) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, request.signal, execution),
-        nativeOptions: {
-          log, comboName: modelStr, comboStrategy,
-          comboStickyLimit: settings.comboStickyRoundRobinLimit, sessionId,
-          smartPolicy: cfg.smartPolicy || "smart", sessionSticky: cfg.sessionSticky !== false,
-          confidenceThreshold: cfg.confidenceThreshold ?? 0.8,
-          resolveSmartChoice: comboStrategy === "smart" ? (b, m) => resolveSmartChoice({ body: b, models: m, routerModel: cfg.routerModel, log }) : null,
-        },
-      });
-    }
+    const comboStrategy = comboSpecificStrategy || (settings.comboStrategy === "routeweave" ? "fallback" : settings.comboStrategy) || "fallback";
+    if (comboStrategy === "routeweave") return routeweaveCombo(body, comboModels, modelStr, settings, clientRawRequest, request, apiKey);
+    const bypassResponse = handleBypassRequest(body, modelStr, request?.headers?.get("user-agent") || "", !!settings.ccFilterNaming);
+    if (bypassResponse) return bypassResponse.response || bypassResponse;
     const augmentedModels = await filterAdapterModels(keyAccess, augmentModelsWithCapacityAdapter(comboModels, requiredCapabilities, settings), comboModels);
     const adapterAdded = augmentedModels.filter((m) => !comboModels.includes(m));
 
@@ -190,7 +165,8 @@ export async function handleChat(request, clientRawRequest = null) {
     });
   }
 
-  if (routeweave) return errorResponse(422, "RouteWeave opt-in requires a flat combo");
+  const bypassResponse = handleBypassRequest(body, modelStr, request?.headers?.get("user-agent") || "", !!settings.ccFilterNaming);
+  if (bypassResponse) return bypassResponse.response || bypassResponse;
 
   // Single model request — may still switch to a capacity-adapter model if the
   // target lacks a capability the request needs (e.g. no vision, request has an image).
@@ -214,6 +190,23 @@ export async function handleChat(request, clientRawRequest = null) {
   return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null);
 }
 
+async function routeweaveCombo(body, models, comboName, settings, clientRawRequest, request, apiKey) {
+  let config;
+  try { config = readRouteweaveConfig(); } catch {
+    return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, "Invalid RouteWeave server configuration");
+  }
+  return handleRouteweaveCombo({
+    config, body, models, signal: request?.signal, nativeOptions: { log, comboName },
+    resolveModel: async id => {
+      const info = await getModelInfo(id);
+      assertRouteweaveTransforms(settings, clientRawRequest?.headers, info.provider);
+      return info;
+    },
+    runCombo: handleComboChat,
+    dispatch: (b, id, execution) => handleSingleModelChat(b, id, clientRawRequest, request, apiKey, null, execution.signal, execution),
+  });
+}
+
 /**
  * Handle single model chat request
  */
@@ -230,7 +223,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       // Check for combo-specific strategy first, fallback to global
       const comboStrategies = chatSettings.comboStrategies || {};
       const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
-      const comboStrategy = comboSpecificStrategy || chatSettings.comboStrategy || "fallback";
+      const comboStrategy = comboSpecificStrategy || (chatSettings.comboStrategy === "routeweave" ? "fallback" : chatSettings.comboStrategy) || "fallback";
+      if (comboStrategy === "routeweave") return routeweaveCombo(body, comboModels, modelStr, chatSettings, clientRawRequest, request, apiKey);
       const requiredCapabilities = detectRequiredCapabilities(body);
       // Nested combo (a combo member that is itself a combo): the access decision
       // was made on the outer target; only drop adapter models the key may not call.
@@ -343,6 +337,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     // Use shared chatCore
     const chatSettings = await getSettings();
     const providerThinking = (chatSettings.providerThinking || {})[provider] || null;
+    if (execution) assertRouteweaveTransforms(chatSettings, clientRawRequest?.headers, provider);
     assertRouteweaveDispatch(execution?.expiresAt, signal);
     const result = await handleChatCore({
       body: { ...body, model: `${provider}/${model}` },

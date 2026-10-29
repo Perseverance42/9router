@@ -116,6 +116,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   if (useTransport && credentials) credentials.runtimeTransport = useTransport;
   const stripList = getModelStrip(alias, model);
 
+  if (routeweave) {
+    const saversEnabled = clientRawRequest?.headers?.[TOKEN_SAVER_HEADER]?.toLowerCase() !== "off";
+    if ((saversEnabled && (rtkEnabled || headroomEnabled || (cavemanEnabled && cavemanLevel) || (ponytailEnabled && ponytailLevel))) || customPromptEnabled || pxpipeEnabled || (providerThinking?.mode && providerThinking.mode !== "auto")) throw Error("RouteWeave excludes effective request transforms");
+  }
+
   // Inject provider-level thinking config override (only if client hasn't set)
   // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
   if (providerThinking?.mode && providerThinking.mode !== "auto") {
@@ -400,7 +405,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // exception: it is decoded by the executor into OpenAI-compatible output.
   let providerResponseFormat = targetFormat;
   try {
-    streamController.signal.throwIfAborted();
+    assertRouteweaveDispatch(routeweaveExpiresAt, streamController.signal);
     const result = await executor.execute({
       model,
       body: translatedBody,
@@ -412,6 +417,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       log,
       proxyOptions,
       providerOverrides,
+      routeweave,
       routeweaveExpiresAt,
     });
     providerResponse = result.response;
@@ -425,20 +431,21 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     }
     reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
   } catch (error) {
+    const requestAborted = streamController.signal.aborted || error.name === "AbortError";
     trackPendingRequest(model, provider, connectionId, false, true);
-    appendRequestLog({ model, provider, connectionId, status: `FAILED ${error.name === "AbortError" ? 499 : HTTP_STATUS.BAD_GATEWAY}` }).catch(() => { });
+    appendRequestLog({ model, provider, connectionId, status: `FAILED ${requestAborted ? 499 : HTTP_STATUS.BAD_GATEWAY}` }).catch(() => { });
     saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,
       latency: { ttft: 0, total: Date.now() - requestStartTime },
       tokens: { prompt_tokens: 0, completion_tokens: 0 },
       request: extractRequestConfig(body, stream),
       providerRequest: translatedBody || null,
-      response: { error: error.message || String(error), status: error.name === "AbortError" ? 499 : 502, thinking: null },
+      response: { error: error.message || String(error), status: requestAborted ? 499 : 502, thinking: null },
       pxpipe: pxpipeSummary,
       status: "error"
     })).catch(() => { });
 
-    if (error.name === "AbortError") {
+    if (requestAborted) {
       streamController.handleError(error);
       return createErrorResult(499, "Request aborted");
     }
@@ -474,7 +481,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
           try { await onCredentialsRefreshed(newCredentials); } catch (e) { log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`); }
         }
         try {
-          streamController.signal.throwIfAborted();
+          assertRouteweaveDispatch(routeweaveExpiresAt, streamController.signal);
           const retryResult = await executor.execute({
             model,
             body: translatedBody,
@@ -486,6 +493,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
             log,
             proxyOptions,
             providerOverrides,
+            routeweave,
             routeweaveExpiresAt,
           });
           if (retryResult.response.ok) {
@@ -541,7 +549,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     if (upstreamEvidence && result?.response) setRouteweaveEvidence(result.response, upstreamEvidence);
     return result;
   };
-  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log };
+  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log, routeweave };
   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
 

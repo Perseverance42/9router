@@ -26,8 +26,11 @@ registerHooks({ resolve(specifier, context, next) {
   if (context.parentURL?.endsWith("/executors/base.js") && specifier === "../utils/proxyFetch.js") return { url: 'data:text/javascript,export const proxyAwareFetch=(...args)=>globalThis.routeweaveBoundaryFetch(...args);', shortCircuit: true };
   return next(specifier, context);
 } });
+const originalFetch = globalThis.fetch;
+globalThis.fetch = (...args) => globalThis.boundaryFetch(...args);
+test.after(() => { globalThis.fetch = originalFetch; });
 const { assertRouteweaveRoute } = await import("../../open-sse/services/routeweaveRoute.js");
-const { inspectRouteweaveUpstream, observeResponse, setRouteweaveEvidence } = await import("../../open-sse/services/routeweaveEvidence.js");
+const { inspectRouteweaveUpstream, observeResponse, setRouteweaveEvidence, checkRouteweaveJson } = await import("../../open-sse/services/routeweaveEvidence.js");
 const { handleRouteweaveCombo } = await import("../../src/sse/services/routeweave.mjs");
 const { handleComboChat } = await import("../../open-sse/services/combo.js");
 const { DefaultExecutor } = await import("../../open-sse/executors/default.js");
@@ -239,4 +242,72 @@ test("real DefaultExecutor checks expiry before initial fetch and retries; retry
   assert.ok(Date.now() - started < 500);
   assert.equal(calls, 2);
   assert.equal(cancelledBodies, 2);
+});
+
+test("service decisions and outcomes enforce TLS and DNS-bypass guards through real proxy fetch", { timeout: 5000 }, async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (...args) => globalThis.boundaryFetch(...args);
+  const { proxyAwareFetch } = await import("../../open-sse/utils/proxyFetch.js");
+  try {
+  const rule = { text: true, tokens_per_byte: 1, template_tokens: 100, context_tokens: 10000, max_output_tokens: 1000 };
+  for (const endpoint of ["decisions", "outcomes"]) {
+    for (const transport of ["tls", "dns"]) {
+      let calls = 0;
+      let failure;
+      const config = { url: "https://sidecar.test", token: "service-only", mode: "active_required", allowlist: Object.fromEntries(models.map(id => [id, rule])) };
+      globalThis.boundaryFetch = async () => {
+        calls++;
+        throw Object.assign(Error("certificate rejected"), { cause: { code: "DEPTH_ZERO_SELF_SIGNED_CERT" } });
+      };
+      const response = await handleRouteweaveCombo({
+        config, body: { model: "combo", messages: [{ role: "user", content: "hello" }], max_tokens: 100, stream: false }, models, nativeOptions: { log }, resolveModel: async id => ({ provider: "openai", model: id.split("/")[1] }),
+        runCombo: handleComboChat, dispatch: async () => Response.json(answer),
+        fetchImpl: async (url, init) => {
+          const request = JSON.parse(init.body);
+          if (!url.endsWith(endpoint)) return Response.json({ decision_id: "d", request_id: request.request_id, mode: request.mode, candidate_snapshot_id: request.candidate_snapshot_id, policy_revision: "p", status: "ranked", ranking: request.candidates.map(c => ({ candidate_id: c.id, score: 1 })), expires_at: new Date(Date.now() + 30000).toISOString() });
+          try {
+            assert.equal(init.strictTls, true);
+            assert.equal(init.routeweave, true);
+            return await proxyAwareFetch(transport === "dns" ? "https://cloudcode-pa.googleapis.com/v1/test" : url, init);
+          } catch (error) {
+            failure = error;
+            throw error;
+          }
+        },
+      });
+      const responseBody = await response.text();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.ok(failure, `${endpoint}/${transport}: expected transport failure, got ${response.status}: ${responseBody}`);
+      assert.match(failure.message, transport === "tls" ? /certificate rejected/ : /DNS bypass/);
+      assert.equal(calls, transport === "tls" ? 1 : 0);
+      assert.equal(response.status, endpoint === "decisions" ? 503 : 200);
+    }
+  }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("all RouteWeave attempts reject manual DNS bypass even without decision expiry", async () => {
+  let calls = 0; globalThis.boundaryFetch = async () => { calls++; return Response.json(answer); };
+  const { proxyAwareFetch } = await import("../../open-sse/utils/proxyFetch.js");
+  await assert.rejects(proxyAwareFetch("https://cloudcode-pa.googleapis.com/v1/test", { routeweave: true }), /DNS bypass/);
+  assert.equal(calls, 0);
+});
+
+
+test("bounded JSON, buffered SSE and oversized frames reject before EOF and cancel reader", async () => {
+  for (const [contentType, buffered] of [["application/json", false], ["text/event-stream", true], ["text/event-stream", false]]) {
+    let cancelled = false;
+    const inspected = inspectRouteweaveUpstream(new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(" ".repeat(270000))); }, cancel() { cancelled = true; } }), { headers: { "content-type": contentType } }), null, buffered);
+    await assert.rejects(inspected.response.text(), /too large/);
+    assert.equal(cancelled, true); assert.equal(inspected.state.status, "failed");
+  }
+  assert.equal((await checkRouteweaveJson(Response.json({ choices: [], padding: "x".repeat(270000) }))).valid, false);
+});
+
+
+test("core maps Error-valued client cancellation to 499, not backend failure", async () => {
+  const controller = new AbortController();
+  globalThis.routeweaveBoundaryFetch = async () => { controller.abort(Error("client disconnected")); throw controller.signal.reason; };
+  const result = await handleChatCore({ body: structuredClone(body), modelInfo: { provider: "openai", model: "a" }, credentials: { apiKey: "test" }, log, signal: controller.signal, routeweave: true });
+  assert.equal(result.response.status, 499);
 });

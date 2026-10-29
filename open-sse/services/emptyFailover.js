@@ -108,9 +108,15 @@ function inspectResponsesEvent(obj) {
 
 // Inspect one complete client-format SSE line (parsed with the shared parseSSELine) and report
 // whether it carries content and/or a finish reason. Non-data lines and "[DONE]" carry nothing.
-export function inspectSSELine(line) {
+export function inspectSSELine(line, requireText = false) {
   const parsed = parseSSELine(line.trimStart());
   if (!parsed || parsed.done) return { content: false, finishReason: null };
+  // RouteWeave admits text only and must not commit to whitespace-only output.
+  if (requireText) {
+    const content = [parsed.delta?.text, parsed.content_block?.text, ...((parsed.choices || []).map(c => (c.delta || c.message)?.content))]
+      .some(text => typeof text === "string" && text.trim().length > 0);
+    return { content, finishReason: inspectSSELine(line).finishReason };
+  }
   if (typeof parsed.type === "string" && !Array.isArray(parsed.choices)) {
     return parsed.type.startsWith(RESPONSES_EVENT_PREFIX) ? inspectResponsesEvent(parsed) : inspectClaudeEvent(parsed);
   }
@@ -129,7 +135,7 @@ export function scanSSEBuffer(text, state = { sawContent: false, finishReason: n
   const lines = text.split("\n");
   state.pending = lines.pop();
   for (const line of lines) {
-    const info = inspectSSELine(line);
+    const info = inspectSSELine(line, state.requireText);
     if (info.content) state.sawContent = true;
     if (info.finishReason) state.finishReason = info.finishReason;
   }
@@ -149,12 +155,12 @@ export function isNoRetryFinish(finishReason) {
 // possibly-valid slow stream). Returns the decision, the buffered head bytes, the live reader,
 // and — if the deadline fired mid-read — the still-pending read() (`pendingRead`) so the caller
 // can resume from it WITHOUT abandoning the chunk it will deliver.
-export async function peekStreamForContent(body, { deadlineMs = EMPTY_PEEK_DEADLINE_MS, maxBytes = Infinity } = {}) {
+export async function peekStreamForContent(body, { deadlineMs = EMPTY_PEEK_DEADLINE_MS, maxBytes = Infinity, requireText = false } = {}) {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const headChunks = [];
   let headBytes = 0;
-  const state = { sawContent: false, finishReason: null };
+  const state = { sawContent: false, finishReason: null, requireText };
   let textBuf = "";
 
   // Clamp: 0 / NaN / negative would otherwise disable the timeout and let a stalled-but-open

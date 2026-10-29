@@ -2,6 +2,7 @@
  * Shared combo (model combo) handling with fallback support
  */
 
+import { setTimeout as delay } from "node:timers/promises";
 import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
@@ -22,7 +23,7 @@ import {
 async function peekComboResponse(result, log, routeweave = false) {
   const ct = (result.headers.get("content-type") || "").toLowerCase();
   if (!result.body || !ct.includes("text/event-stream")) return null;
-  const peeked = await peekStreamForContent(result.body, routeweave ? { maxBytes: 256 * 1024 } : {});
+  const peeked = await peekStreamForContent(result.body, routeweave ? { maxBytes: 256 * 1024, requireText: true } : {});
   const response = new Response(reconstructStream(peeked.head, peeked.reader, peeked.pendingRead), {
     status: result.status,
     statusText: result.statusText,
@@ -559,7 +560,7 @@ export async function handleComboChat({
         // (empty) response as-is, preserving prior behaviour rather than manufacturing a 5xx.
         const reasonLabel = peeked.finishReason || "no-content";
         const isLast = i === rotatedModels.length - 1;
-        if (routeweave && isNoRetryFinish(peeked.finishReason)) return selected(preserveEvidence(peeked.response), modelStr);
+        if (routeweave && (upstreamEvidence?.noRetry || isNoRetryFinish(peeked.finishReason))) return selected(preserveEvidence(peeked.response), modelStr);
         if (routeweave && isLast) {
           await peeked.response.body?.cancel().catch(() => {});
           throw Error("Unusable RouteWeave stream");
@@ -636,7 +637,7 @@ export async function handleComboChat({
       if (cooldownMs && cooldownMs > 0 && cooldownMs <= 5000 &&
           (result.status === 503 || result.status === 502 || result.status === 504)) {
         log.info("COMBO", `Model ${modelStr} transient ${result.status}, waiting ${cooldownMs}ms before next`);
-        await new Promise(r => setTimeout(r, cooldownMs));
+        await delay(cooldownMs, undefined, { signal: signal ?? undefined });
       }
 
       // Fallback to next model
