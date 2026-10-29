@@ -1,11 +1,11 @@
 import { beforeEach, expect, it, vi } from "vitest";
 
 const fx = vi.hoisted(() => ({ combos: [], settings: {}, keys: {} }));
-const mocks = vi.hoisted(() => ({ core: vi.fn(), credentials: vi.fn(), refresh: vi.fn() }));
+const mocks = vi.hoisted(() => ({ core: vi.fn(), credentials: vi.fn(), refresh: vi.fn(), lookup: vi.fn(), systemone: vi.fn() }));
 vi.mock("@/lib/localDb", () => ({
   getSettings: async () => fx.settings,
   getModelAliases: async () => ({}),
-  getComboByName: async (name) => fx.combos.find((c) => c.name === name) || null,
+  getComboByName: mocks.lookup,
   getProviderNodes: async () => [],
   getCombos: async () => fx.combos,
   getCustomModels: async () => [],
@@ -21,10 +21,12 @@ vi.mock("@/sse/services/tokenRefresh.js", () => ({
   checkAndRefreshToken: mocks.refresh, updateProviderCredentials: vi.fn(),
 }));
 vi.mock("open-sse/handlers/chatCore.js", () => ({ handleChatCore: mocks.core }));
+vi.mock("open-sse/handlers/systemoneCore.js", () => ({ handleSystemoneCore: mocks.systemone }));
 
 const { handleChat } = await import("../../src/sse/handlers/chat.js");
 const { resetComboRotation } = await import("../../open-sse/services/combo.js");
 const { deliverFusionCompletion } = await import("../../open-sse/services/fusionOutput.js");
+const { resolveSmartChoice } = await import("../../src/sse/services/systemoneRouter.js");
 const completion = (message) => Response.json({
   id: "chatcmpl-test", model: "test", object: "chat.completion", created: 1,
   choices: [{ index: 0, message: { role: "assistant", ...message }, finish_reason: message.tool_calls ? "tool_calls" : "stop" }],
@@ -47,6 +49,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   resetComboRotation();
   fx.combos = [];
+  mocks.lookup.mockImplementation(async (name) => fx.combos.find((c) => c.name === name) || null);
+  mocks.systemone.mockResolvedValue({ success: false });
   fx.keys = { key: { isActive: true, access: { restricted: false, allow: [] } } };
   fx.settings = { comboStrategy: "fallback", comboStrategies: {},
     cavemanEnabled: true, headroomEnabled: true, rtkEnabled: true, customPromptEnabled: true };
@@ -132,9 +136,9 @@ it.each(["panel", "judge"])("executes nested Fusion as a %s without consuming it
   expect((await result.json()).choices[0].message.content).toContain("Answer");
   const inner = mocks.core.mock.calls.map(([x]) => x).filter((x) => x.modelInfo.model === "inner-judge");
   if (kind === "judge") {
-    expect(inner[0].body.tools.map((t) => t.function.name)).toEqual(["consult_panel", "consult_panel_internal"]);
-    expect(inner[0].body.messages[0].content).toContain("invoke consult_panel_internal exactly once");
-    expect(inner[0].body.tool_choice.function.name).toBe("consult_panel_internal");
+    expect(inner[0].body.tools.map((t) => t.function.name)).toEqual(["consult_panel", "consult_panel_1"]);
+    expect(inner[0].body.messages[0].content).toContain("invoke consult_panel_1 exactly once");
+    expect(inner[0].body.tool_choice.function.name).toBe("consult_panel_1");
     expect(inner[2].body.tool_choice.function.name).toBe("consult_panel");
   }
 });
@@ -168,6 +172,82 @@ it("bounds acyclic combo nesting before credential lookup", async () => {
   const result = await chat();
   expect(result.status).toBe(400);
   expect((await result.json()).error.message).toContain("too deeply nested combo");
+  expect(mocks.credentials).not.toHaveBeenCalled();
+});
+
+it.each(["openai/router", "", 123])("checks external Smart router access (%s) before credentials", async (routerModel) => {
+  add("Main", ["Smart"], { fallbackStrategy: "fusion", judgeModel: "Smart" });
+  add("Smart", ["openai/panel-a", "openai/panel-b"], { fallbackStrategy: "smart", routerModel });
+  fx.keys.key.access = { restricted: true, allow: ["Main"] };
+  expect((await chat()).status).toBe(403);
+  expect(mocks.credentials).not.toHaveBeenCalled();
+  expect(mocks.systemone).not.toHaveBeenCalled();
+});
+
+it("does not require separate access to an included Smart router", async () => {
+  add("Main", ["Smart"], { fallbackStrategy: "fusion", judgeModel: "Smart" });
+  add("Smart", ["openai/panel-a", "openai/panel-b"], { fallbackStrategy: "smart", routerModel: "openai/panel-a" });
+  fx.keys.key.access = { restricted: true, allow: ["Main"] };
+  expect((await chat()).status).toBe(200);
+  expect(mocks.systemone).toHaveBeenCalled();
+});
+
+it.each(["lookup", "refresh", "core"])("cancels Smart router work during %s", async (step) => {
+  add("Main", ["Smart"], { fallbackStrategy: "fusion", judgeModel: "Smart" });
+  add("Smart", ["openai/panel-a", "openai/panel-b"], { fallbackStrategy: "smart", routerModel: "openai/router" });
+  const parent = new AbortController();
+  if (step === "lookup") mocks.credentials.mockImplementationOnce(async (_p, _e, _m, { signal }) => {
+    expect(signal.aborted).toBe(false);
+    parent.abort();
+    return { connectionId: "connection" };
+  });
+  if (step === "refresh") mocks.refresh.mockImplementationOnce(async (_p, c, { signal }) => {
+    expect(signal.aborted).toBe(false);
+    parent.abort();
+    return c;
+  });
+  if (step === "core") mocks.systemone.mockImplementationOnce(async ({ signal }) => {
+    expect(signal.aborted).toBe(false);
+    parent.abort();
+    return { success: false };
+  });
+  expect((await chat({}, parent.signal)).status).toBe(499);
+  expect(mocks.credentials).toHaveBeenCalledTimes(1);
+  expect(mocks.credentials.mock.calls[0][3].signal.aborted).toBe(true);
+  expect(mocks.refresh).toHaveBeenCalledTimes(step === "lookup" ? 0 : 1);
+  expect(mocks.systemone).toHaveBeenCalledTimes(step === "core" ? 1 : 0);
+  expect(mocks.core).not.toHaveBeenCalled();
+});
+
+it.each(["credentials", "upstream"])("retains Smart fail-open behavior on %s failure without cancellation", async (step) => {
+  if (step === "credentials") mocks.credentials.mockResolvedValueOnce(null);
+  else mocks.systemone.mockRejectedValueOnce(new Error("unavailable"));
+  expect(await resolveSmartChoice({ body: { messages: [{ role: "user", content: "Question" }] }, models: ["openai/a", "openai/b"], routerModel: "openai/router" })).toBeNull();
+  expect(mocks.systemone).toHaveBeenCalledTimes(step === "credentials" ? 0 : 1);
+});
+
+it("checks shared DAG subtrees once per request", async () => {
+  add("Main", ["Level0a", "Level0b"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
+  for (let i = 0; i < 12; i++) {
+    const children = i === 11 ? ["openai/panel"] : [`Level${i + 1}a`, `Level${i + 1}b`];
+    add(`Level${i}a`, children);
+    add(`Level${i}b`, children);
+  }
+  fx.settings.comboStrategies.Main.fusionTuning = { minPanels: 0, maxPanels: 0 };
+  expect((await chat()).status).toBe(200);
+  expect(mocks.lookup.mock.calls.length).toBeLessThan(110);
+  mocks.lookup.mockClear();
+  expect((await chat()).status).toBe(200);
+  expect(mocks.lookup.mock.calls.length).toBeGreaterThan(24);
+  expect(mocks.lookup.mock.calls.length).toBeLessThan(110);
+});
+
+it("checks an incoming external edge even when its target subtree is cached", async () => {
+  add("Main", ["Shared", "Nested"], { fallbackStrategy: "fusion", judgeModel: "Shared" });
+  add("Shared", ["openai/panel"]);
+  add("Nested", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "Shared" });
+  fx.keys.key.access = { restricted: true, allow: ["Main"] };
+  expect((await chat()).status).toBe(403);
   expect(mocks.credentials).not.toHaveBeenCalled();
 });
 

@@ -205,7 +205,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
     const original = canonicalRequest(body, sourceFormat, internal);
     const publicNames = new Set((original.tools || []).map(toolName));
     let consultToolName = FUSION_TOOL_NAME;
-    while (publicNames.has(consultToolName)) consultToolName += "_internal";
+    for (let suffix = 1; publicNames.has(consultToolName); suffix++) consultToolName = `${FUSION_TOOL_NAME}_${suffix}`;
     const policy = resolveFusionPolicy(models, tuning, consultToolName);
     const judge = judgeModel?.trim() || models[0];
     if (!judge) throw new FusionError("Fusion requires an explicit judge when no panels are configured", stage, {}, 400);

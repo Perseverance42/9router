@@ -29,6 +29,7 @@ import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
 import { getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
 import { resolveSmartChoice } from "../services/systemoneRouter.js";
+import { DEFAULT_SYSTEMONE_ROUTER_MODEL } from "open-sse/services/systemoneRouter.js";
 
 /**
  * Handle chat completion request
@@ -193,6 +194,7 @@ function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAcce
     preflight: execution.internal ? undefined : async (models, canonical) => {
       const required = detectRequiredCapabilities(canonical);
       const settings = await getSettings();
+      const completed = new Set();
       const visit = async (targets, members, path) => {
         for (const target of targets) {
           signal?.throwIfAborted();
@@ -201,13 +203,22 @@ function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAcce
             const denied = await enforceKeyAccess(keyAccess, target);
             if (denied) return denied;
           }
+          if (path.includes(target)) throw new Error(`Cyclic or too deeply nested combo: ${target}`);
+          if (completed.has(target)) continue;
           const info = await getModelInfo(target);
           if (!info.provider) {
             const children = await getComboModels(target, { allowEmpty: true });
             if (!children) throw new Error(`Invalid Fusion target: ${target}`);
-            if (path.includes(target) || path.length >= 32) throw new Error(`Cyclic or too deeply nested combo: ${target}`);
+            if (path.length >= 32) throw new Error(`Cyclic or too deeply nested combo: ${target}`);
             const cfg = settings.comboStrategies?.[target] || {};
             const strategy = cfg.fallbackStrategy || settings.comboStrategy || "fallback";
+            if (strategy === "smart" && children.length > 1) {
+              const router = (typeof cfg.routerModel === "string" && cfg.routerModel.trim()) || DEFAULT_SYSTEMONE_ROUTER_MODEL;
+              if (!children.includes(router)) {
+                const denied = await enforceKeyAccess(keyAccess, router);
+                if (denied) return denied;
+              }
+            }
             const judge = strategy === "fusion" ? cfg.judgeModel?.trim() || children[0] : null;
             const denied = await visit([...new Set([...children, ...(judge ? [judge] : [])])], children, [...path, target]);
             if (denied) return denied;
@@ -217,6 +228,7 @@ function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAcce
               if (required.has(capability) && !caps[capability]) throw new Error(`Fusion target ${target} lacks ${capability}`);
             }
           }
+          completed.add(target);
         }
       };
       return visit(models, comboModels, execution.comboPath || []);
@@ -293,6 +305,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
               body: b,
               models: m,
               routerModel: comboCfg.routerModel,
+              signal: execution.signal,
               log,
             })
           : null,

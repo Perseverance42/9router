@@ -32,6 +32,7 @@ export async function resolveSmartChoice({
   routerModel = DEFAULT_SYSTEMONE_ROUTER_MODEL,
   log,
   timeoutMs = DEFAULT_SYSTEMONE_TIMEOUT_MS,
+  signal,
 }) {
   if (!Array.isArray(models) || models.length <= 1) return null;
 
@@ -49,20 +50,24 @@ export async function resolveSmartChoice({
   if (Object.keys(criteria).length === 0) return null;
 
   try {
+    signal?.throwIfAborted();
     const modelInfo = await getModelInfo(targetModel);
+    signal?.throwIfAborted();
     if (!modelInfo?.provider) {
       log?.warn?.("COMBO", `smart-router: unrecognized router model "${targetModel}"`);
       return null;
     }
 
     const { provider, model } = modelInfo;
-    const credentials = await getProviderCredentials(provider, new Set(), model);
+    const credentials = await getProviderCredentials(provider, new Set(), model, { signal });
+    signal?.throwIfAborted();
     if (!credentials || credentials.allRateLimited) {
       log?.warn?.("COMBO", `smart-router: no credentials available for router provider "${provider}"`);
       return null;
     }
 
-    const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
+    const refreshedCredentials = await checkAndRefreshToken(provider, credentials, { signal });
+    signal?.throwIfAborted();
     const systemoneBody = {
       model,
       state,
@@ -84,6 +89,7 @@ export async function resolveSmartChoice({
       body: systemoneBody,
       modelInfo: { provider, model },
       credentials: refreshedCredentials,
+      signal,
       log,
       onRequestSuccess: () => {},
     });
@@ -95,12 +101,14 @@ export async function resolveSmartChoice({
       clearTimeout(timeoutId);
     }
 
+    signal?.throwIfAborted();
     if (!result?.success || !result.response) {
       log?.warn?.("COMBO", `smart-router: evaluation failed (${result?.status || "error"})`);
       return null;
     }
 
     const json = await result.response.json();
+    signal?.throwIfAborted();
     const route = parseSystemOneRouteAnswer(json);
     if (!route || !route.choice) {
       log?.warn?.("COMBO", "smart-router: response missing valid route choice");

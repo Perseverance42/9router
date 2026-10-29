@@ -71,6 +71,34 @@ describe("handleSystemoneCore request", () => {
     expect(r.headers["x-opencode-session"]).toBeUndefined();
   });
 
+  it("propagates cancellation to fetch and suppresses success after body cancellation", async () => {
+    const parent = new AbortController();
+    const reason = new Error("Fusion sibling failed");
+    const onRequestSuccess = vi.fn();
+    let upstreamSignal;
+    vi.stubGlobal("fetch", vi.fn(async (_url, { signal }) => {
+      upstreamSignal = signal;
+      return { ok: true, json: async () => { parent.abort(reason); return { ok: true }; } };
+    }));
+    await expect(handleSystemoneCore({
+      body: { state: "s", questions: { q: {} } },
+      modelInfo: { provider: "ollama-local", model: "clef" }, credentials: {},
+      signal: parent.signal, onRequestSuccess,
+    })).rejects.toBe(reason);
+    expect(upstreamSignal.aborted).toBe(true);
+    expect(upstreamSignal.reason).toBe(reason);
+    expect(onRequestSuccess).not.toHaveBeenCalled();
+  });
+
+  it("does not fetch after cancellation", async () => {
+    const parent = new AbortController();
+    parent.abort();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(handleSystemoneCore({ signal: parent.signal })).rejects.toBe(parent.signal.reason);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("still sends the session header to OpenCode Zen", async () => {
     const r = await call("opencode-zen", "jev-1.13", { apiKey: "k" });
     expect(r.headers["x-opencode-session"]).toMatch(/^ses_/);

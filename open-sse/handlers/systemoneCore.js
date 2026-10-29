@@ -36,7 +36,9 @@ export async function handleSystemoneCore({
   credentials,
   log,
   onRequestSuccess,
+  signal,
 }) {
+  signal?.throwIfAborted();
   const { provider, model } = modelInfo;
   const cfg = PROVIDER_MEDIA[provider]?.systemoneConfig;
   let targetUrl = buildSystemoneUrl(credentials?.providerSpecificData?.baseUrl, cfg);
@@ -90,8 +92,8 @@ export async function handleSystemoneCore({
       headers,
       body: JSON.stringify(requestBody),
       ...(typeof AbortSignal?.timeout === "function"
-        ? { signal: AbortSignal.timeout(FETCH_CONNECT_TIMEOUT_MS) }
-        : {}),
+        ? { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(FETCH_CONNECT_TIMEOUT_MS)]) : AbortSignal.timeout(FETCH_CONNECT_TIMEOUT_MS) }
+        : { signal }),
     });
   } catch (error) {
     const errMsg = formatProviderError(error, provider, model, HTTP_STATUS.BAD_GATEWAY);
@@ -99,6 +101,7 @@ export async function handleSystemoneCore({
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, errMsg);
   }
 
+  signal?.throwIfAborted();
   if (!providerResponse.ok) {
     const { statusCode, message } = await parseUpstreamError(providerResponse);
     const errMsg = formatProviderError(new Error(message), provider, model, statusCode);
@@ -113,6 +116,7 @@ export async function handleSystemoneCore({
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
   }
 
+  signal?.throwIfAborted();
   if (onRequestSuccess) await onRequestSuccess();
 
   const usage = responseBody?.usage;

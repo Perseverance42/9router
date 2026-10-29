@@ -251,6 +251,22 @@ describe("Fusion controller", () => {
     expect(captured[0][0].body.messages[0].content).not.toBe(captured[1][0].body.messages[0].content);
   });
 
+  it("allocates bounded consultation names across deep inherited collisions", async () => {
+    const tools = Array.from({ length: 100 }, (_, i) => ({ type: "function", function: {
+      name: i === 0 ? "consult_panel" : `consult_panel_${i}`, parameters: { type: "object" },
+    } }));
+    tools.push({ type: "function", function: { name: "consult_panel" + "_internal".repeat(6), parameters: { type: "object" } } });
+    const fn = vi.fn(async (body) => {
+      const name = body.tools.at(-1).function.name;
+      expect(name).toBe("consult_panel_100");
+      expect(name.length).toBeLessThanOrEqual(64);
+      expect(new Set(body.tools.map((t) => t.function.name)).size).toBe(body.tools.length);
+      return response({ content: "Direct" });
+    });
+    expect((await run(fn, { internal: true, body: { ...base, tools }, tuning: { minPanels: 0, maxPanels: 2 } })).status).toBe(200);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
   it("never mutates the original or shares panel request graphs", async () => {
     const original = structuredClone(base);
     const bodies = [];
