@@ -35,6 +35,7 @@ const debugItems = [
 ];
 
 const systemItems = [
+  { href: "/dashboard/routeweave", label: "RouteWeave", icon: "alt_route" },
   { href: "/dashboard/proxy-pools", label: "Proxy Pools", icon: "lan" },
   { href: "/dashboard/skills", label: "Skills", icon: "extension" },
 ];

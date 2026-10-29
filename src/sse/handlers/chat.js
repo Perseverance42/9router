@@ -192,7 +192,7 @@ export async function handleChat(request, clientRawRequest = null) {
 
 async function routeweaveCombo(body, models, comboName, settings, clientRawRequest, request, apiKey) {
   let config;
-  try { config = readRouteweaveConfig(); } catch {
+  try { config = readRouteweaveConfig(process.env, settings.routeweave); } catch {
     return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, "Invalid RouteWeave server configuration");
   }
   return handleRouteweaveCombo({

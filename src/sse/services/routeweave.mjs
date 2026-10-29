@@ -3,7 +3,7 @@ import { observeResponse } from "../../../open-sse/services/routeweaveEvidence.j
 export { observeResponse } from "../../../open-sse/services/routeweaveEvidence.js";
 import { assertRouteweaveRoute } from "../../../open-sse/services/routeweaveRoute.js";
 
-const MODES = new Set(["shadow", "active_advisory", "active_required"]);
+import { resolveRouteweaveConfig } from "../../shared/utils/routeweaveSettings.mjs";
 const MAX_BYTES = 256 * 1024;
 const MAX_CANDIDATES = 32;
 const DEFAULT_DECISION_TIMEOUT_MS = 35_000;
@@ -21,14 +21,8 @@ function failure(message, status = 503) {
 }
 
 // Called only after resolving the saved per-combo RouteWeave strategy.
-export function readRouteweaveConfig(env = process.env) {
-  const url = new URL(env.ROUTEWEAVE_URL);
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error("Invalid RouteWeave URL");
-  const mode = env.ROUTEWEAVE_MODE || "active_required";
-  if (!MODES.has(mode) || typeof env.ROUTEWEAVE_SERVICE_TOKEN !== "string" || !/^[\x21-\x7e]+$/.test(env.ROUTEWEAVE_SERVICE_TOKEN)) throw Error("Missing RouteWeave mode or service token");
-  const allowlist = JSON.parse(env.ROUTEWEAVE_ALLOWLIST || "null");
-  if (!allowlist || typeof allowlist !== "object" || Array.isArray(allowlist)) throw Error("Missing authoritative RouteWeave allowlist");
-  return { url: url.href.replace(/\/$/, ""), token: env.ROUTEWEAVE_SERVICE_TOKEN, mode, allowlist, decisionTimeoutMs: decisionTimeout(env.ROUTEWEAVE_DECISION_TIMEOUT_MS) };
+export function readRouteweaveConfig(env = process.env, saved) {
+  return resolveRouteweaveConfig(env, saved);
 }
 
 export function assertRouteweaveTransforms(settings, headers, provider) {

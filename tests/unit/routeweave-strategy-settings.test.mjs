@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { maskRouteweaveSettings } from "../../src/shared/utils/routeweaveSettings.mjs";
 
 const page = readFileSync(new URL("../../src/app/(dashboard)/dashboard/combos/page.js", import.meta.url), "utf8");
 const settingsRoute = readFileSync(new URL("../../src/app/api/settings/route.js", import.meta.url), "utf8");
@@ -51,10 +52,12 @@ test("RouteWeave is available in the shared single and bulk strategy selector", 
   assert.match(page, /onSetStrategy\(\{ fallbackStrategy: e\.target\.value \}\)/);
   assert.match(page, /if \(v\) handleBulkSetStrategy\(v\)/);
   assert.match(page, /current === "routeweave"/);
-  assert.match(page, /private backend configured in server environment variables/);
-  assert.match(page, /flat canonical OpenAI\/Anthropic targets/);
+  assert.match(page, /Configure the shared backend/);
+  assert.match(page, /<RouteweaveConnection compact/);
+  assert.match(page, /flat canonical OpenAI\/Anthropic API-key routes/);
+  assert.match(page, /positive max_tokens/);
   assert.match(page, /default active_required/);
-  assert.match(page, /Shadow uses admitted original order, not Smart Router/);
+  assert.match(page, /shadow observes while dispatching admitted order/);
 });
 
 test("selecting RouteWeave persists the entire map and preserves unrelated combo fields", async () => {
@@ -99,6 +102,7 @@ function settingsPatch() {
   const writes = [];
   let resets = 0;
   const bindings = {
+    maskRouteweaveSettings,
     NextResponse: { json: (body, init) => ({ body, status: init?.status || 200 }) },
     PROTECTED_SETTING_KEYS: ["password", "mitmSudoEncrypted"],
     SETTINGS_RESPONSE_HEADERS: { "Cache-Control": "no-store" },

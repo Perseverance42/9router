@@ -10,6 +10,8 @@ import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { useModelCaps } from "@/shared/hooks/useModelCaps";
 import { aggregateComboCapabilities } from "open-sse/providers/capabilities.js";
 import { resolveProviderId, AI_PROVIDERS } from "@/shared/constants/providers";
+import RouteweaveConnection from "@/shared/components/RouteweaveConnection";
+import Link from "next/link";
 
 // Validate combo name: only a-z, A-Z, 0-9, -, _
 const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
@@ -401,6 +403,7 @@ export default function CombosPage() {
             <li><span className="font-medium text-text-main">Fallback</span> — tries models in order (next on failure)</li>
             <li><span className="font-medium text-text-main">Round Robin</span> — rotates models across requests to spread load</li>
             <li><span className="font-medium text-text-main">Smart Router</span> — queries a System One decision model to pick the optimal model before generation; supports Smart Switch (adaptive hysteresis), Strict Lock (1 task = 1 session, +0ms latency), and Per-Turn modes to maximize prompt-cache retention</li>
+            <li><span className="font-medium text-text-main">RouteWeave</span> — a private backend classifies text requests and ranks the combo&apos;s admitted candidates using its routing policy. Configure the shared backend below, then select RouteWeave per combo; classification and routing policy live in the backend UI.</li>
             <li><span className="font-medium text-text-main">Fusion</span> — queries all models in parallel, then a judge synthesizes one answer. Best quality, but costs the most: every request bills all panel models + the judge (N+1 calls)</li>
           </ul>
           <p className="hidden text-xs text-text-muted mt-3 max-w-2xl">
@@ -580,6 +583,8 @@ export default function CombosPage() {
         </div>
       )}
 
+      <RouteweaveConnection compact />
+
       {/* Capacity Adapter */}
       <CapacityAdapterSection
         capacityAdapter={capacityAdapter}
@@ -717,8 +722,8 @@ function ComboCard({ combo, getCaps, comboByName = {}, activeProviders = [], cop
             )}
             {current === "routeweave" && (
               <p className="mt-2 text-[11px] text-text-muted">
-                Requires a private backend configured in server environment variables. Plain text only; flat canonical OpenAI/Anthropic targets, no nested candidate combos.
-                {" "}Mode is server-configured (default active_required). Shadow uses admitted original order, not Smart Router.
+                <Link href="/dashboard/routeweave" className="text-primary underline">Configure the shared backend</Link> and certified candidate limits. Plain-text Chat Completions or Claude Messages with positive max_tokens (max_completion_tokens must match when supplied); flat canonical OpenAI/Anthropic API-key routes, no tools, media or nested combos. Disable effective token savers, custom prompts, PXPIPE and provider-thinking overrides. Capacity adapters do not add candidates.
+                {" "}Required mode fails closed on backend failure; advisory falls back to admitted order; shadow observes while dispatching admitted order. Mode is global (default active_required), not Smart Router.
               </p>
             )}
             {/* Fusion: judge picker (Auto = first model) */}

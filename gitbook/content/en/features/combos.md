@@ -141,6 +141,15 @@ Uses a **System One decision model** (configured under **Media Providers → Sys
 ### 4. Fusion
 Queries all panel models in parallel, then uses a Judge model to synthesize one final high-quality answer. Best for complex reasoning where multiple perspectives are needed.
 
+### 5. RouteWeave (Experimental)
+Uses a private RouteWeave backend to classify text requests and rank the combo's admitted candidates. Configure the shared connection under **Dashboard → RouteWeave**, then select **RouteWeave** as the strategy on each combo. The Combos page shows configuration/readiness status and an **Open RouteWeave** link for managing classification and routing policy in the backend UI.
+
+- **Global connection, per-combo selection:** backend URL, optional browser-facing UI URL, dedicated consumer service token, mode, decision timeout and authoritative candidate limits. Saving the connection does not activate RouteWeave for other combos.
+- **Modes:** Required fails closed on a missing/invalid/expired decision. Advisory falls back to admitted order on backend failure. Shadow observes the decision while dispatching admitted order. All modes enforce the same admission limits; none fall back to Smart Router.
+- **Supported requests:** plain-text Chat Completions or Claude Messages ending in a nonempty user message, with explicit positive `max_tokens`. Only flat canonical OpenAI/Anthropic routes using the supported default executors; no tools, media, Responses, thinking suffixes or nested candidate combos. Capacity adapters cannot add candidates. Token-saver transforms and other request mutations must be disabled for these requests.
+- **Readiness is not an inference test:** status checks do not validate the service token, candidate limits or live provider calls. Configure an active policy in RouteWeave and certify each allowlisted route before sending traffic.
+- **Credentials:** the consumer token stays server-side and is never included in browser links. The backend UI uses its own operator authentication.
+
 ---
 
 ## Cursor / Claude Default Combos

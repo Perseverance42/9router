@@ -86,7 +86,7 @@ beforeEach(() => {
   for (const k of envKeys) delete process.env[k];
   Object.assign(process.env, {
     ROUTEWEAVE_COMBOS: "unrelated",
-    ROUTEWEAVE_URL: "http://routeweave.invalid",
+    ROUTEWEAVE_URL: "https://routeweave.invalid",
     ROUTEWEAVE_SERVICE_TOKEN: "service-secret",
     ROUTEWEAVE_ALLOWLIST: JSON.stringify(allowlist),
   });
@@ -145,6 +145,16 @@ test("saved per-combo RouteWeave strategy activates without an environment name 
   assert.equal(fixture.native[0].comboStrategy, "fallback");
 });
 
+test("saved global connection drives dispatch even with an invalid environment connection", async () => {
+  fixture.settings.routeweave = { url: "https://saved.invalid", token: "service-secret", mode: "shadow", allowlist, decisionTimeoutMs: 1000 };
+  process.env.ROUTEWEAVE_URL = "invalid-url";
+  process.env.ROUTEWEAVE_ALLOWLIST = "invalid-json";
+  const { response } = await chat();
+  assert.equal(response.status, 200);
+  assert.equal(fixture.decisions[0].mode, "shadow");
+  assert.equal(fixture.core[0].body.model, models[0]);
+});
+
 test("valid dispatch may finish after expiry without admitting a later account attempt", async t => {
   let now = Date.now();
   t.mock.method(Date, "now", () => now);
@@ -185,11 +195,11 @@ test("cancelled core completion is abandoned and its body cancelled", async () =
 
 test("environment defaults to required mode and ignores the obsolete combo list", () => {
   const config = readRouteweaveConfig({
-    ROUTEWEAVE_URL: "http://routeweave.invalid/", ROUTEWEAVE_SERVICE_TOKEN: "token",
+    ROUTEWEAVE_URL: "https://routeweave.invalid/", ROUTEWEAVE_SERVICE_TOKEN: "token",
     ROUTEWEAVE_COMBOS: "a-different-name", ROUTEWEAVE_ALLOWLIST: JSON.stringify(allowlist),
   });
   assert.equal(config.mode, "active_required");
-  assert.equal(config.url, "http://routeweave.invalid");
+  assert.equal(config.url, "https://routeweave.invalid");
   assert.deepEqual(config.allowlist, allowlist);
 });
 
