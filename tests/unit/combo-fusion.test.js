@@ -94,7 +94,7 @@ describe("Fusion controller", () => {
     const result = await run(fn);
     expect(result.status).toBe(502);
     expect(siblingSignal.aborted).toBe(true);
-    expect((await result.json()).error).toMatchObject({ message: "provider exploded", details: { model: "p/a", slot: "panel_1", upstream_status: 503 } });
+    expect((await result.json()).error).toEqual({ message: "Fusion upstream model call failed", type: "fusion_error", code: "fusion_upstream_error", details: { stage: "panel", retryable: true, upstream_status: 503 } });
     expect(fn).toHaveBeenCalledTimes(3);
   });
 

@@ -30,7 +30,7 @@ describe("Fusion streamed tool boundary", () => {
       });
       const text = await response.text();
       expect(text).not.toContain("read_file");
-      expect(text).toContain("Fusion synthesis violates");
+      expect(text).toContain(events.includes('"length"') ? '"code":"fusion_tool_output_truncated"' : '"code":"fusion_stream_incomplete"');
     }
   });
   for (const [sourceFormat, events] of Object.entries(toolEvents)) {
@@ -56,7 +56,7 @@ describe("Fusion streamed tool boundary", () => {
         if (name === "read_file") expect(text).toBe(events(name));
         else {
           expect(text).not.toContain("consult_panel");
-          expect(text).toContain("Fusion synthesis violates");
+          expect(text).toContain('"code":"fusion_invalid_tool_calls"');
           expect(controller.signal.aborted).toBe(true);
         }
       }

@@ -181,8 +181,14 @@ export function formatSSE(data, sourceFormat) {
 //
 // NOTE: non-SSE client formats (Ollama NDJSON) get an SSE frame here — dead in
 // practice because detectFormatByEndpoint never resolves to OLLAMA.
-export function buildStreamErrorBytes(statusCode, message, clientFormat) {
+export function buildStreamErrorBytes(statusCode, message, clientFormat, metadata = null) {
   const { error } = buildErrorBody(statusCode, message);
+  // Caller supplies already-sanitized metadata; never forward arbitrary fields.
+  if (metadata) {
+    error.type = metadata.type;
+    error.code = metadata.code;
+    error.details = metadata.details;
+  }
 
   const sse = clientFormat === FORMATS.CLAUDE
     ? formatSSE({ type: "error", error }, FORMATS.CLAUDE)

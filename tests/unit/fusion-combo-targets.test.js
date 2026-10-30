@@ -102,7 +102,7 @@ it.each(["Panel", "Judge", "NestedJudge"])("checks the weakest reachable capabil
   fx.settings.capacityAdapter = { vision: { enabled: true, models: ["openai/gpt-4o"] } };
   const result = await chat({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,AA==" } }] }] });
   expect(result.status).toBe(400);
-  expect((await result.json()).error.message).toContain("text-only lacks vision");
+  expect((await result.json()).error).toMatchObject({ code: "fusion_preflight_error", details: { stage: "preflight", retryable: false } });
   expect(mocks.credentials).not.toHaveBeenCalled();
 });
 
@@ -162,7 +162,7 @@ it.each(["member", "judge"])("rejects a recursive %s edge in preflight", async (
   add("Nested", edge === "member" ? ["Main"] : ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: edge === "judge" ? "Main" : "openai/judge" });
   const result = await chat();
   expect(result.status).toBe(400);
-  expect((await result.json()).error.message).toContain("Cyclic or too deeply nested combo: Main");
+  expect((await result.json()).error).toMatchObject({ code: "fusion_preflight_error", details: { stage: "preflight", retryable: false } });
   expect(mocks.credentials).not.toHaveBeenCalled();
 });
 
@@ -171,7 +171,7 @@ it("bounds acyclic combo nesting before credential lookup", async () => {
   for (let i = 0; i < 32; i++) add(`Level${i}`, [i === 31 ? "openai/panel" : `Level${i + 1}`]);
   const result = await chat();
   expect(result.status).toBe(400);
-  expect((await result.json()).error.message).toContain("too deeply nested combo");
+  expect((await result.json()).error).toMatchObject({ code: "fusion_preflight_error", details: { stage: "preflight", retryable: false } });
   expect(mocks.credentials).not.toHaveBeenCalled();
 });
 
@@ -250,7 +250,7 @@ it.each([29, 30])("checks cached subtree depth on a shallow-first DAG with %i in
   const result = await chat();
   expect(result.status).toBe(length === 29 ? 200 : 400);
   if (length === 30) {
-    expect((await result.json()).error.message).toContain("too deeply nested combo: Shared");
+    expect((await result.json()).error).toMatchObject({ code: "fusion_preflight_error", details: { stage: "preflight", retryable: false } });
     expect(mocks.credentials).not.toHaveBeenCalled();
     expect(mocks.core).not.toHaveBeenCalled();
     expect(mocks.systemone).not.toHaveBeenCalled();
