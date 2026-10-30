@@ -671,7 +671,11 @@ Choose **Fusion** and a judge on the Combos page. The judge sees the conversatio
 - Supports OpenAI Chat, Claude Messages, and OpenAI Responses clients with JSON function tools. Panels and judges may be concrete models or combos; each combo remains one logical target using its configured strategy. Input capabilities are the intersection of all configured reachable members and Fusion judges, checked before dispatch. Cycles and nesting beyond 32 combo levels are rejected.
 - Unsupported native/hosted tools, Responses `previous_response_id`, and Claude media that cannot survive translation are rejected before model calls. Supply explicit history.
 - Client cancellation aborts internal work. No Fusion-specific deadline is added; existing provider, transport, and stream-stall limits still apply. Public usage belongs to the delivered judge completion; internal calls retain separate usage records. `fusion_no_usable_action` includes `retryable: false` when no usable action satisfies the client constraints.
+- Panel advice excludes provider reasoning and requests concise prose. Context checks use a text estimate (UTF-8 bytes / 3), a 75% context allowance, and output reserves; unknown models use capability heuristics (200k context by default). Media costs are not estimated. Private generations have output ceilings; public answers keep caller limits. When needed, the existing analyst call summarizes panel prose without replacing history, JSON, tools, or arguments. Requests that still do not fit fail with non-retryable `fusion_context_budget`.
+- Explicit caller reasoning intent follows all Fusion stages and nested combos, overriding concrete-target thinking suffixes only within Fusion. Without explicit intent, configured defaults remain. Fusion-only suffixes such as `Fusion(high)` and `Fusion(8192)` are supported; exact combo names and aliases win. Model listings advertise the effective judge's reasoning capabilities, following existing first-member semantics for fallback judges rather than guaranteeing every fallback leaf.
 - Web search/fetch execution inside panels is not implemented.
+
+Fusion's canonical feature branch is `feature/fusion-controller`. Keep Fusion fixes there, merge upstream changes without rewriting published history, and promote to `main` only after review and passing tests.
 
 ### 📝 Request Logging
 
