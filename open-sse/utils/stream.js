@@ -46,8 +46,8 @@ const PENDING_COMPLETION_FLUSH_MS = 3000;
 export function createSSEStream(options = {}) {
   const {
     mode = STREAM_MODE.TRANSLATE,
-    targetFormat,
-    sourceFormat,
+    targetFormat = mode === STREAM_MODE.PASSTHROUGH ? FORMATS.OPENAI : undefined,
+    sourceFormat = mode === STREAM_MODE.PASSTHROUGH ? FORMATS.OPENAI : undefined,
     provider = null,
     reqLogger = null,
     toolNameMap = null,

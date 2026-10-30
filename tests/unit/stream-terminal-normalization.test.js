@@ -9,7 +9,7 @@ vi.mock("@/lib/usageDb.js", () => ({
 }));
 
 import { FORMATS } from "../../open-sse/translator/formats.js";
-import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger } from "../../open-sse/utils/stream.js";
+import { createSSEStream, createSSETransformStreamWithLogger, createPassthroughStreamWithLogger } from "../../open-sse/utils/stream.js";
 import { guardFusionStream } from "../../open-sse/services/fusionStream.js";
 import { handleStreamingResponse } from "../../open-sse/handlers/chatCore/streamingHandler.js";
 import { createStreamController } from "../../open-sse/utils/streamHandler.js";
@@ -58,7 +58,8 @@ async function run(raw, upstream = FORMATS.OPENAI, output = FORMATS.OPENAI, pass
     });
     normalizedBody = result.response.body;
   } else {
-    const transform = passthrough ? createPassthroughStreamWithLogger("openai", null, "test", null, null, callback, null, null, upstream)
+    const transform = passthrough === "direct" ? createSSEStream({ mode: "passthrough", provider: "openai" })
+      : passthrough ? createPassthroughStreamWithLogger("openai", null, "test", null, null, callback, null, null, upstream)
       : createSSETransformStreamWithLogger(upstream, output, "test", null, null, "test", null, null, callback);
     normalizedBody = input.pipeThrough(transform);
   }
@@ -119,26 +120,26 @@ describe("wire completion normalization through registered translators and Fusio
     }
   }
 
-  for (const passthrough of [false, true]) {
-    it(`preserves native OpenAI DONE (${passthrough ? "passthrough" : "translate"})`, async () => {
+  for (const passthrough of [false, true, "direct"]) {
+    it(`preserves native OpenAI DONE (${passthrough === "direct" ? "direct defaults" : passthrough ? "passthrough" : "translate"})`, async () => {
       const result = await run(data(chat({ content: "Hello" })) + data(chat({}, "stop")) + done, FORMATS.OPENAI, FORMATS.OPENAI, passthrough);
       accepted(result);
       expect(result.text.match(/data: \[DONE\]/g)).toHaveLength(1);
     });
-    it(`preserves native OpenAI tools (${passthrough ? "passthrough" : "translate"})`, async () => {
+    it(`preserves native OpenAI tools (${passthrough === "direct" ? "direct defaults" : passthrough ? "passthrough" : "translate"})`, async () => {
       const tool = { index: 0, id: "call_terminal", type: "function", function: { name: "lookup", arguments: '{"city":"Paris"}' } };
       accepted(await run(data(chat({ tool_calls: [tool] })) + data(chat({}, "tool_calls")) + done, FORMATS.OPENAI, FORMATS.OPENAI, passthrough), true);
     });
-    it(`rejects native finish without DONE (${passthrough ? "passthrough" : "translate"})`, async () => {
+    it(`rejects native finish without DONE (${passthrough === "direct" ? "direct defaults" : passthrough ? "passthrough" : "translate"})`, async () => {
       rejected(await run(data(chat({ content: "Hello" })) + data(chat({}, "stop")), FORMATS.OPENAI, FORMATS.OPENAI, passthrough));
     });
-    it(`rejects native partial content (${passthrough ? "passthrough" : "translate"})`, async () => {
+    it(`rejects native partial content (${passthrough === "direct" ? "direct defaults" : passthrough ? "passthrough" : "translate"})`, async () => {
       rejected(await run(data(chat({ content: "Hello" })), FORMATS.OPENAI, FORMATS.OPENAI, passthrough));
     });
-    it(`rejects upstream native errors (${passthrough ? "passthrough" : "translate"})`, async () => {
+    it(`rejects upstream native errors (${passthrough === "direct" ? "direct defaults" : passthrough ? "passthrough" : "translate"})`, async () => {
       rejected(await run(data({ error: { message: "failed" } }) + done, FORMATS.OPENAI, FORMATS.OPENAI, passthrough));
     });
-    it(`does not hide malformed native data with DONE (${passthrough ? "passthrough" : "translate"})`, async () => {
+    it(`does not hide malformed native data with DONE (${passthrough === "direct" ? "direct defaults" : passthrough ? "passthrough" : "translate"})`, async () => {
       rejected(await run(data(chat({ content: "Hello" })) + "data: {broken\n\n" + done, FORMATS.OPENAI, FORMATS.OPENAI, passthrough));
     });
   }
@@ -156,7 +157,7 @@ describe("wire completion normalization through registered translators and Fusio
   }
   for (const passthrough of [false, true]) {
     for (const multiline of [false, true]) {
-      it(`accepts ${multiline ? "multiline JSON" : "empty data events"} (${passthrough ? "passthrough" : "translate"})`, async () => {
+      it(`accepts ${multiline ? "multiline JSON" : "empty data events"} (${passthrough === "direct" ? "direct defaults" : passthrough ? "passthrough" : "translate"})`, async () => {
         const content = multiline
           ? JSON.stringify(chat({ content: "Hello" }), null, 2).split("\n").map(line => `data: ${line}\n`).join("") + "\n"
           : data(chat({ content: "Hello" }));
