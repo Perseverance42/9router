@@ -25,9 +25,8 @@ const STREAM_MODE = {
   PASSTHROUGH: "passthrough" // No translation, normalize output, extract usage
 };
 
-// Upper bound on the deferred response.completed wait: a chat->responses stream
-// that saw finish_reason without usage must not hold the client's terminal event
-// forever when the upstream stalls with no usage trailer and no [DONE].
+// Bound translator usage deferral. This timeout does not authorize successful
+// completion: a stalled upstream without its terminal event remains incomplete.
 const PENDING_COMPLETION_FLUSH_MS = 3000;
 
 /**
@@ -99,24 +98,82 @@ export function createSSEStream(options = {}) {
   let finalized = false;
   let completionFlushTimer = null;
   let upstreamCompleted = false;
+  let upstreamStarted = false;
   let upstreamInvalid = false;
+  // Hold only terminal frames. Text still streams; Fusion owns tool validation.
+  const pendingTerminals = [];
+  let eventData = [];
+  let eventName = null;
+
+  // SSE data fields belong to one event, not one JSON object per line.
+  const assembleEvents = (lines, eof = false) => {
+    if (targetFormat === FORMATS.OLLAMA) return lines;
+    const events = [];
+    const dispatch = () => {
+      const payload = eventData.join("\n");
+      if (payload.trim()) {
+        if (eventName) events.push(`event: ${eventName}`);
+        let value = payload;
+        try { value = JSON.stringify(JSON.parse(payload)); } catch { /* classified below */ }
+        events.push(`data: ${value}`, "");
+      }
+      eventData = [];
+      eventName = null;
+    };
+    for (const raw of lines) {
+      const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+      if (!line) { dispatch(); continue; }
+      const colon = line.indexOf(":");
+      const field = colon === -1 ? line : line.slice(0, colon);
+      let value = colon === -1 ? "" : line.slice(colon + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (field === "data") eventData.push(value);
+      if (field === "event") eventName = value;
+    }
+    if (eof) dispatch();
+    return events;
+  };
+
+  const emitOutput = (output, controller) => {
+    const terminal = output.split("\n").some((line) => {
+      if (!line.startsWith("data:")) return false;
+      const parsed = parseSSELine(line);
+      return parsed?.type === "message_stop" ||
+        ["response.completed", "response.done", "response.incomplete"].includes(parsed?.type);
+    });
+    if (terminal) { pendingTerminals.push(output); return; }
+    reqLogger?.appendConvertedChunk?.(output);
+    controller.enqueue(sharedEncoder.encode(output));
+  };
+  const releaseTerminals = (controller) => {
+    if (!upstreamCompleted || upstreamInvalid) return;
+    finalizeStream();
+    for (const output of pendingTerminals.splice(0)) {
+      reqLogger?.appendConvertedChunk?.(output);
+      controller.enqueue(sharedEncoder.encode(output));
+    }
+  };
 
   // Only wire-level completion counts. Translators can synthesize finish_reason
   // on flush, even when the upstream disconnected mid-response.
   const observeCompletion = (line, parsed) => {
-    if (!line.startsWith("data:")) return;
+    if (!line.trim() || (!line.startsWith("data:") && targetFormat !== FORMATS.OLLAMA)) return;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       upstreamInvalid = true;
       return;
     }
+    if (targetFormat === FORMATS.OLLAMA && parsed.done === true) upstreamCompleted = true;
+    if (parsed.type === "message_start" && parsed.message?.id) upstreamStarted = true;
+    if (sourceFormat === FORMATS.OPENAI_RESPONSES &&
+        ["length", "content_filter", "max_tokens"].includes(parsed.choices?.[0]?.finish_reason || parsed.delta?.stop_reason || parsed.done_reason)) upstreamInvalid = true;
     if (parsed.error || parsed.type === "error" || parsed.type === "response.failed" ||
         parsed.response?.error || ["failed", "incomplete"].includes(parsed.response?.status) ||
         parsed.type === "response.incomplete") upstreamInvalid = true;
     if (((mode === STREAM_MODE.PASSTHROUGH || targetFormat === FORMATS.OPENAI) && line.slice(5).trim() === "[DONE]") ||
-        (targetFormat === FORMATS.CLAUDE && parsed.type === "message_stop" && state?.messageId) ||
+        (targetFormat === FORMATS.CLAUDE && parsed.type === "message_stop" && upstreamStarted) ||
         (targetFormat === FORMATS.OPENAI_RESPONSES &&
           ["response.completed", "response.done"].includes(parsed.type) &&
-          parsed.response?.status === "completed")) upstreamCompleted = true;
+          (parsed.response?.status === undefined || parsed.response.status === "completed"))) upstreamCompleted = true;
   };
 
   const emitCompletedOpenAIStream = (controller) => {
@@ -164,31 +221,31 @@ export function createSSEStream(options = {}) {
     }
   };
 
-  // Emit the deferred response.completed now — at [DONE], or when the watchdog
-  // below gives up on a usage trailer that never arrives.
+  // Flush translator state after its usage wait, but release completion only
+  // after the upstream supplied its own terminal event.
   const flushPendingCompletion = (controller) => {
     const completed = translateResponse(targetFormat, sourceFormat, null, state);
     for (const item of completed || []) {
       if (item === null || item === undefined) continue;
       const output = formatSSE(item, sourceFormat);
-      reqLogger?.appendConvertedChunk?.(output);
-      controller.enqueue(sharedEncoder.encode(output));
+      emitOutput(output, controller);
       sseEmittedCount++;
     }
-    finalizeStream();
+    releaseTerminals(controller);
   };
 
-  return new TransformStream({
-    transform(chunk, controller) {
+  const processChunk = (chunk, controller, eof = false) => {
       if (!ttftAt) ttftAt = Date.now();
       const text = decoder.decode(chunk, { stream: true });
       buffer += text;
       reqLogger?.appendProviderChunk?.(text);
 
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
+      const trailingCR = !eof && buffer.endsWith("\r");
+      const lines = (trailingCR ? buffer.slice(0, -1) : buffer).split(/\r\n|\r|\n/);
+      buffer = (lines.pop() || "") + (trailingCR ? "\r" : "");
+      if (eof && buffer) { lines.push(buffer); buffer = ""; }
 
-      for (const line of lines) {
+      for (const line of assembleEvents(lines, eof)) {
         const trimmed = line.trim();
         if (isDebugEnabled && trimmed) {
           sseLineCount++;
@@ -342,8 +399,7 @@ export function createSSEStream(options = {}) {
             }
           }
 
-          reqLogger?.appendConvertedChunk?.(output);
-          controller.enqueue(sharedEncoder.encode(output));
+          emitOutput(output, controller);
           // Responses clients (codex CLI) close on response.completed instead of [DONE]
           if (responsesTerminal) finalizeStream();
           continue;
@@ -388,7 +444,7 @@ export function createSSEStream(options = {}) {
           }
 
           emitCompletedOpenAIStream(controller);
-          if (keepsOpenAIResponsesFormat && !streamDoneSent) {
+          if (keepsOpenAIResponsesFormat && !upstreamInvalid && !streamDoneSent) {
             const doneOutput = "data: [DONE]\n\n";
             reqLogger?.appendConvertedChunk?.(doneOutput);
             controller.enqueue(sharedEncoder.encode(doneOutput));
@@ -442,8 +498,7 @@ export function createSSEStream(options = {}) {
         // Responses same-format passthrough: re-emit with original event framing
         if (keepsOpenAIResponsesFormat && openAIResponsesEventName) {
           const output = formatSSE({ event: openAIResponsesEventName, data: parsed }, sourceFormat);
-          reqLogger?.appendConvertedChunk?.(output);
-          controller.enqueue(sharedEncoder.encode(output));
+          emitOutput(output, controller);
           currentOpenAIResponsesEvent = null;
           sseEmittedCount++;
           // Responses clients (codex) close on response.completed instead of [DONE]
@@ -485,15 +540,14 @@ export function createSSEStream(options = {}) {
             }
 
             const output = formatSSE(item, sourceFormat);
-            reqLogger?.appendConvertedChunk?.(output);
-            controller.enqueue(sharedEncoder.encode(output));
+            emitOutput(output, controller);
             sseEmittedCount++;
           }
         }
 
         // The completion deferral can outlive the upstream: a broken chat upstream
         // may stall after finish_reason with no usage trailer and no [DONE], holding
-        // the connection open. Bound the wait so the client still gets a terminal event.
+        // the connection open. Bound translator usage wait, not completion evidence.
         if (targetFormat === FORMATS.OPENAI && sourceFormat === FORMATS.OPENAI_RESPONSES &&
             state?.completionPending && !state?.completedSent && !completionFlushTimer) {
           completionFlushTimer = setTimeout(() => {
@@ -503,8 +557,11 @@ export function createSSEStream(options = {}) {
           }, PENDING_COMPLETION_FLUSH_MS);
         }
       }
-    },
+      releaseTerminals(controller);
+  };
 
+  return new TransformStream({
+    transform: processChunk,
     flush(controller) {
       const evtSummary = Object.entries(eventTypeCounts).map(([k, v]) => `${k}=${v}`).join(",") || "none";
       dbg("SSE", `flush | provider=${provider} | model=${model} | recvLines=${sseLineCount} | emitted=${sseEmittedCount} | events=[${evtSummary}]`);
@@ -513,60 +570,11 @@ export function createSSEStream(options = {}) {
         const remaining = decoder.decode();
         if (remaining) buffer += remaining;
 
+        processChunk(new Uint8Array(), controller, true);
         if (mode === STREAM_MODE.PASSTHROUGH) {
-          if (buffer) {
-            const line = buffer.trim();
-            observeCompletion(line, parseSSELine(line));
-            let output = buffer;
-            if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
-              output = "data: " + buffer.slice(5);
-            }
-            if (line.slice(5).trim() !== "[DONE]") {
-              reqLogger?.appendConvertedChunk?.(output);
-              controller.enqueue(sharedEncoder.encode(output));
-            }
-          }
-
           finalizeStream();
           emitCompletedOpenAIStream(controller);
           return;
-        }
-
-        if (buffer.trim()) {
-          // Same parse as the transform loop: without targetFormat this only
-          // accepts "data: " lines, so an NDJSON provider (Ollama) lost whatever
-          // arrived without its closing newline.
-          const parsed = parseSSELine(buffer.trim(), targetFormat);
-          observeCompletion(buffer.trim(), parsed);
-          // parseSSELine turns the SSE sentinel "data: [DONE]" into { done: true },
-          // which must not be translated. An Ollama chunk also carries done:true,
-          // but it is the real final chunk — it holds finish_reason and the token
-          // counts — so it has to go through.
-          const isDoneSentinel = parsed?.done && targetFormat !== FORMATS.OLLAMA;
-          if (parsed && !isDoneSentinel) {
-            // Same accumulation the transform loop does, so finalizeStream() can
-            // log a tail chunk's tokens instead of falling back to null.
-            const extracted = extractUsage(parsed);
-            if (extracted) state.usage = mergeUsage(state.usage, extracted);
-
-            const translated = translateResponse(targetFormat, sourceFormat, parsed, state);
-
-            if (translated?._openaiIntermediate) {
-              for (const item of translated._openaiIntermediate) {
-                const openaiOutput = formatSSE(item, FORMATS.OPENAI);
-                reqLogger?.appendOpenAIChunk?.(openaiOutput);
-              }
-            }
-
-            if (translated?.length > 0) {
-              for (const item of translated) {
-                if (item === null || item === undefined) continue;
-                const output = formatSSE(item, sourceFormat);
-                reqLogger?.appendConvertedChunk?.(output);
-                controller.enqueue(sharedEncoder.encode(output));
-              }
-            }
-          }
         }
 
         const flushed = translateResponse(targetFormat, sourceFormat, null, state);
@@ -582,8 +590,7 @@ export function createSSEStream(options = {}) {
           for (const item of flushed) {
             if (item === null || item === undefined) continue;
             const output = formatSSE(item, sourceFormat);
-            reqLogger?.appendConvertedChunk?.(output);
-            controller.enqueue(sharedEncoder.encode(output));
+            emitOutput(output, controller);
           }
         }
 
@@ -596,7 +603,7 @@ export function createSSEStream(options = {}) {
           openAIResponsesTerminalSeen = true;
         }
 
-        if (keepsOpenAIResponsesFormat && !openAIResponsesDoneSent && !streamDoneSent) {
+        if (keepsOpenAIResponsesFormat && !upstreamInvalid && !openAIResponsesDoneSent && !streamDoneSent) {
           const doneOutput = "data: [DONE]\n\n";
           reqLogger?.appendConvertedChunk?.(doneOutput);
           controller.enqueue(sharedEncoder.encode(doneOutput));
@@ -605,6 +612,7 @@ export function createSSEStream(options = {}) {
         }
 
         finalizeStream();
+        releaseTerminals(controller);
         emitCompletedOpenAIStream(controller);
       } catch (error) {
         console.log("Error in flush:", error);

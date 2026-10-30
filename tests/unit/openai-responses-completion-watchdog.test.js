@@ -6,7 +6,7 @@ import { createSSETransformStreamWithLogger } from "../../open-sse/utils/stream.
 // A chat->responses stream defers response.completed when finish_reason arrives
 // without usage (PR #4476). If the upstream then stalls — no usage trailer, no
 // [DONE], connection held open — that deferral must not wait forever: the
-// watchdog flushes the terminal event after PENDING_COMPLETION_FLUSH_MS.
+// watchdog may flush translator state, but only real [DONE] releases completion.
 const encoder = new TextEncoder();
 
 const FINISH_CHUNK = {
@@ -44,7 +44,7 @@ async function pipe() {
 }
 
 describe("pending response.completed watchdog", () => {
-  it("flushes the deferred completion when the upstream stalls after finish_reason", async () => {
+  it("withholds deferred completion when the upstream stalls after finish_reason", async () => {
     vi.useFakeTimers();
     try {
       const { source, reader } = await pipe();
@@ -56,9 +56,7 @@ describe("pending response.completed watchdog", () => {
       source.close();
 
       const completed = completedResponses(await readAll(reader));
-      expect(completed.length, "exactly one response.completed").toBe(1);
-      expect(completed[0].status).toBe("completed");
-      expect(completed[0].usage, "no usage was ever reported").toBeUndefined();
+      expect(completed, "no successful completion without upstream DONE").toHaveLength(0);
     } finally {
       vi.useRealTimers();
     }
@@ -75,6 +73,7 @@ describe("pending response.completed watchdog", () => {
 
       // Well past the watchdog window: nothing more may be emitted.
       await vi.advanceTimersByTimeAsync(10000);
+      source.enqueue(encoder.encode("data: [DONE]\n\n"));
       source.close();
 
       const completed = completedResponses(await readAll(reader));

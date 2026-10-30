@@ -72,7 +72,7 @@ describe("SSE providers keep their sentinel handling", () => {
     const stream = new ReadableStream({
       start(controller) {
         controller.enqueue(encoder.encode(
-          `data: ${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}\ndata: [DONE]`,
+          `data: ${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}\n\ndata: [DONE]`,
         ));
         controller.close();
       },

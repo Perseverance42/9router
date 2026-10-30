@@ -16,7 +16,8 @@ import { createSSETransformStreamWithLogger } from "../../open-sse/utils/stream.
  */
 async function runTransform(chunks, targetFormat = FORMATS.OPENAI) {
   const encoder = new TextEncoder();
-  const input = chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("");
+  const input = chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") +
+    (targetFormat === FORMATS.OPENAI ? "data: [DONE]\n\n" : "");
 
   const stream = new ReadableStream({
     start(controller) {
