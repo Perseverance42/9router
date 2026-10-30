@@ -4,6 +4,7 @@ import { ROLE, CLAUDE_BLOCK } from "../translator/schema/index.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { parseModel } from "./model.js";
 import { translateRequest } from "../translator/index.js";
+import { captureThinking } from "../translator/concerns/thinkingUnified.js";
 import { detectFormat } from "./provider.js";
 import { deliverFusionCompletion } from "./fusionOutput.js";
 import { guardFusionStream, safeFusionError, logFusionFailure } from "./fusionStream.js";
@@ -87,7 +88,8 @@ function canonicalRequest(body, sourceFormat, internal) {
     }
   }
   const copy = structuredClone(body);
-  const canonical = translateRequest(sourceFormat, FORMATS.OPENAI, body.model, copy, false);
+  // Canonical history is not a physical model request; apply capabilities only at dispatch.
+  const canonical = translateRequest(sourceFormat, FORMATS.OPENAI, body.model, copy, false, null, null, null, [], null, null, { sourceOnly: true });
   if (!canonical || !Array.isArray(canonical.messages)) throw new FusionError("Unsupported Fusion conversation format", "preflight", {}, 400);
   for (const key of ["max_tokens", "max_completion_tokens"]) {
     if (canonical[key] !== undefined && (!Number.isInteger(canonical[key]) || canonical[key] <= 0)) {
@@ -202,7 +204,7 @@ function capOutput(request, cap) {
 const budgetError = (stage) => new FusionError("Fusion request exceeds the safe context budget", stage, { code: "fusion_context_budget" }, 400);
 
 /** One bounded consultation: initial controller, parallel panel, analyst, native synthesis. */
-export async function handleFusionChat({ body, models, handleSingleModel, log, judgeModel, tuning, signal, sourceFormat = detectFormat(body), outputFormat = sourceFormat, internal = false, preflight, getModelLimits, maxOutputTokens }) {
+export async function handleFusionChat({ body, models, handleSingleModel, log, judgeModel, tuning, signal, sourceFormat = detectFormat(body), outputFormat = sourceFormat, internal = false, preflight, getModelLimits, maxOutputTokens, reasoningIntent = captureThinking(body, true) }) {
   const controller = new AbortController();
   const onAbort = () => controller.abort(signal.reason);
   if (signal?.aborted) onAbort();
@@ -244,7 +246,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
     try {
       response = await abortable(() => handleSingleModel(structuredClone(request), model, {
         internal: true, sourceFormat: FORMATS.OPENAI, outputFormat,
-        signal: controller.signal, stage: callStage,
+        signal: controller.signal, stage: callStage, reasoningIntent,
         ...(positive(ceiling) ? { maxOutputTokens: ceiling } : {}),
       }), controller.signal);
     } catch (error) {

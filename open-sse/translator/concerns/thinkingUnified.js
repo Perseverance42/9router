@@ -106,11 +106,13 @@ export function extractThinking(body) {
 // Besides the effort, records whether an OpenAI-shaped client wants the thinking
 // text itself: Claude returns it only with thinking.display "summarized", a field
 // OpenAI has no equivalent for, so the intent cannot survive translation on its own.
-export function captureThinking(body) {
-  const cfg = extractThinking(body);
+export function captureThinking(body, preservePresentation = false) {
+  const summary = preservePresentation && typeof body?.reasoning?.summary === "string" ? body.reasoning.summary : undefined;
+  const nativeDisplay = preservePresentation && typeof body?.thinking?.display === "string" ? body.thinking.display : undefined;
+  const cfg = extractThinking(body) || (summary !== undefined || nativeDisplay ? { mode: "auto" } : null);
   if (!cfg || cfg.mode === "none") return cfg;
-  const display = openAIThinkingDisplay(body);
-  return display ? { ...cfg, display } : cfg;
+  const display = nativeDisplay || (summary === "none" ? "omitted" : openAIThinkingDisplay(body));
+  return { ...cfg, ...(display ? { display } : {}), ...(summary !== undefined ? { summary } : {}) };
 }
 
 function openAIThinkingDisplay(body) {
@@ -432,11 +434,11 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
 // Mutates and returns body. No-op when model has no reasoning capability.
 // `intent` is a pre-captured config (from captureThinking on the original body);
 // falls back to extracting from the current body when omitted.
-export function applyThinking(targetFormat, model, body, provider = null, intent = undefined) {
+export function applyThinking(targetFormat, model, body, provider = null, intent = undefined, preferIntent = false) {
   if (!body || typeof body !== "object") return body;
 
   const { cleanModel, override } = parseSuffix(model);
-  const cfg = override || intent || extractThinking(body);
+  const cfg = (preferIntent && intent) || override || intent || extractThinking(body);
   const caps = getCapabilitiesForModel(provider, cleanModel);
 
   // Model cannot reason → strip any stray thinking fields.
@@ -451,8 +453,10 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
   // Anthropic's `display` (summarized | omitted) decides whether thinking text
   // comes back at all; keep what the client asked for instead of resetting it.
   // An OpenAI-shaped client's ask arrives via the captured intent instead.
-  const display = typeof body.thinking?.display === "string" ? body.thinking.display : intent?.display;
+  const display = preferIntent && intent?.display ? intent.display
+    : typeof body.thinking?.display === "string" ? body.thinking.display : intent?.display;
   stripAll(body);
   applyFormat(fmt, body, cfg, caps, supportedLevels, display);
+  if (preferIntent && intent?.summary !== undefined && body.reasoning && fmt === "openai-responses") body.reasoning.summary = intent.summary;
   return body;
 }

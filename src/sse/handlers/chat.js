@@ -10,6 +10,7 @@ import {
 import { handleAntigravityQuotaError, clearAntigravityStrikes } from "../services/antigravityQuota.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
+import { captureThinking, parseSuffix } from "open-sse/translator/concerns/thinkingUnified.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
 import { DEFAULT_HEADROOM_URL } from "@/lib/headroom/detect";
 import { getTransform as getPxpipeTransform } from "@/lib/pxpipe/loader.js";
@@ -57,7 +58,7 @@ export async function handleChat(request, clientRawRequest = null) {
   // Claude Code marks a 1M-context request as `<model>[1m]`; the marker matches
   // no combo, alias or provider/model pair, so it must not reach resolution.
   // The capability travels in the anthropic-beta header, forwarded as-is.
-  const { model: modelStr, contextMarker } = stripModelContextMarker(body.model);
+  let { model: modelStr, contextMarker } = stripModelContextMarker(body.model);
   if (contextMarker) body.model = modelStr;
 
   const session = resolveSessionIdentity({ headers: clientRawRequest?.headers, body });
@@ -77,6 +78,8 @@ export async function handleChat(request, clientRawRequest = null) {
 
   // Enforce API key if enabled in settings
   const settings = await getSettings();
+  const fusionTarget = await resolveFusionTarget(modelStr, settings);
+  modelStr = fusionTarget.model;
   if (settings.requireApiKey) {
     if (!apiKey) {
       log.warn("AUTH", "Missing API key (requireApiKey=true)");
@@ -123,7 +126,7 @@ export async function handleChat(request, clientRawRequest = null) {
       return handleFusionChat({
         body,
         models: comboModels,
-        ...fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels, { comboPath: [modelStr] }),
+        ...fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels, { comboPath: [modelStr], reasoningIntent: fusionTarget.intent ? { ...captureThinking(body, true), ...fusionTarget.intent } : undefined }),
         log,
         comboName: modelStr,
         judgeModel: comboStrategies[modelStr]?.judgeModel,
@@ -182,6 +185,16 @@ export async function handleChat(request, clientRawRequest = null) {
   return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null);
 }
 
+// Literal combo names win. Thinking suffixes are aliases only for Fusion, never fallback combos.
+async function resolveFusionTarget(model, settings) {
+  if (typeof model !== "string" || model.includes("/")) return { model };
+  const { cleanModel, override } = parseSuffix(model);
+  if (!override || await getComboModels(model, { allowEmpty: true })) return { model };
+  const strategy = settings.comboStrategies?.[cleanModel]?.fallbackStrategy || settings.comboStrategy || "fallback";
+  return strategy === "fusion" && await getComboModels(cleanModel, { allowEmpty: true })
+    ? { model: cleanModel, intent: override } : { model };
+}
+
 function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels, execution = {}) {
   const signal = execution.signal || request?.signal;
   const modelLimits = new Map();
@@ -191,9 +204,12 @@ function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAcce
     outputFormat: execution.outputFormat,
     internal: execution.internal,
     maxOutputTokens: execution.maxOutputTokens,
+    reasoningIntent: execution.reasoningIntent,
     getModelLimits: async (target) => {
       const visit = async (model, path = []) => {
         signal?.throwIfAborted();
+        const settings = await getSettings();
+        model = (await resolveFusionTarget(model, settings)).model;
         if (path.includes(model)) throw new Error("Invalid Fusion model limits");
         if (modelLimits.has(model)) {
           const cached = modelLimits.get(model);
@@ -208,7 +224,6 @@ function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAcce
         }
         if (path.length >= 32) throw new Error("Invalid Fusion model limits");
         const children = await getComboModels(model, { allowEmpty: true });
-        const settings = await getSettings();
         const config = settings.comboStrategies?.[model] || {};
         const judge = (config.fallbackStrategy || settings.comboStrategy) === "fusion" ? config.judgeModel?.trim() || children?.[0] : null;
         const members = [...new Set([...(children || []), ...(judge ? [judge] : [])])];
@@ -236,10 +251,11 @@ function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAcce
       const completed = new Map();
       const visit = async (targets, members, path) => {
         let maxDepth = 0;
-        for (const target of targets) {
+        for (const requestedTarget of targets) {
           signal?.throwIfAborted();
+          const target = (await resolveFusionTarget(requestedTarget, settings)).model;
           // A combo grants its members, not an independently configured judge.
-          if (!members.includes(target)) {
+          if (!members.includes(requestedTarget)) {
             const denied = await enforceKeyAccess(keyAccess, target);
             if (denied) return denied;
           }
@@ -294,6 +310,11 @@ function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAcce
  */
 async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, execution = {}) {
   if (execution.signal?.aborted) return errorResponse(499, "Request aborted");
+  if (parseSuffix(modelStr).override) {
+    const target = await resolveFusionTarget(modelStr, await getSettings());
+    modelStr = target.model;
+    if (target.intent && !execution.reasoningIntent) execution = { ...execution, reasoningIntent: { ...captureThinking(body, true), ...target.intent } };
+  }
   const modelInfo = await getModelInfo(modelStr);
 
   // If provider is null, this might be a combo name - check and handle
@@ -422,6 +443,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       externalSignal: execution.signal,
       internal: execution.internal === true,
       maxOutputTokens: execution.maxOutputTokens,
+      reasoningIntent: execution.reasoningIntent,
       responseFormatOverride: execution.outputFormat,
       body: { ...body, model: `${provider}/${model}` },
       modelInfo: { provider, model },

@@ -160,6 +160,23 @@ describe("Fusion internal chat boundary", () => {
     const result = await handleChatCore(options());
     expect(result.response.status).toBe(502);
   });
+  it.each([
+    [{ mode: "level", level: "high", display: "summarized" }, "enabled"],
+    [{ mode: "none" }, "disabled"],
+    [{ mode: "auto", display: "omitted" }, "enabled"],
+    [{ mode: "budget", budget: 8192 }, "enabled"],
+  ])("applies private caller intent after tool-turn normalization at the actual Claude executor (%j)", async (reasoningIntent, type) => {
+    execute.mockResolvedValue(upstream({ type: "message", id: "msg_1", content: [{ type: "text", text: "Safe" }], stop_reason: "end_turn" }));
+    const body = { messages: [{ role: "user", content: "Question" }, { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "read_file", arguments: "{}" } }] }, { role: "tool", tool_call_id: "call_1", content: "Result" }], max_tokens: 20000 };
+    const result = await handleChatCore(options({ body, reasoningIntent, modelInfo: { provider: "anthropic", model: "claude-sonnet-4(low)" }, maxOutputTokens: 4096 }));
+    expect(result.success).toBe(true);
+    const payload = execute.mock.calls[0][0].body;
+    expect(payload.thinking.type).toBe(type);
+    expect(payload.max_tokens).toBeLessThanOrEqual(4096);
+    if (type === "enabled" && reasoningIntent.mode !== "auto") expect(payload.thinking.budget_tokens).toBe(4095);
+    if (reasoningIntent.display) expect(payload.thinking.display).toBe(reasoningIntent.display);
+    expect(payload.reasoningIntent).toBeUndefined();
+  });
   it("propagates cancellation into the executor immediately", async () => {
     const parent = new AbortController();
     let start;

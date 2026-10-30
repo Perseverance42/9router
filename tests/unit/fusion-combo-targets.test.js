@@ -110,6 +110,58 @@ it.each(["fallback", "round-robin"])("keeps a combo panel as one slot with its %
   expect(initial).not.toContain("panel_2:");
 });
 
+it.each(["fallback", "round-robin"])("forwards explicit intent through nested %s leaves without flattening", async (strategy) => {
+  add("Main", ["Panel"], { fallbackStrategy: "fusion", judgeModel: "Judge" });
+  add("Panel", ["openai/panel-bad(low)", "openai/panel-good(low)"], { fallbackStrategy: strategy });
+  add("Judge", ["openai/judge(low)"], { fallbackStrategy: strategy });
+  const previous = mocks.core.getMockImplementation();
+  mocks.core.mockImplementation(async (options) => options.modelInfo.model.includes("panel-bad")
+    ? { success: false, response: new Response("failed", { status: 500 }) } : previous(options));
+  expect((await chat({ reasoning_effort: "high" })).status).toBe(200);
+  for (const [options] of mocks.core.mock.calls) expect(options.reasoningIntent).toEqual({ mode: "level", level: "high", display: "summarized" });
+  expect(modelsCalled()).toContain("panel-bad(low)");
+  expect(modelsCalled()).toContain("panel-good(low)");
+});
+
+it.each([["high", { mode: "level", level: "high" }], ["8192", { mode: "budget", budget: 8192 }]])("routes a Fusion logical suffix %s as explicit caller intent", async (suffix, intent) => {
+  add("Main", ["openai/panel(low)"], { fallbackStrategy: "fusion", judgeModel: "openai/judge(low)" });
+  expect((await chat({ model: `Main(${suffix})`, reasoning_effort: "none" })).status).toBe(200);
+  expect(mocks.core).toHaveBeenCalledTimes(4);
+  for (const [options] of mocks.core.mock.calls) expect(options.reasoningIntent).toMatchObject(intent);
+});
+
+it("keeps configured concrete judge and panel modes when the caller has no intent", async () => {
+  add("Main", ["openai/panel(high)"], { fallbackStrategy: "fusion", judgeModel: "openai/judge(low)" });
+  expect((await chat()).status).toBe(200);
+  expect(modelsCalled()).toEqual(["judge(low)", "panel(high)", "judge(low)", "judge(low)"]);
+  for (const [options] of mocks.core.mock.calls) expect(options.reasoningIntent).toBeNull();
+});
+
+it("resolves literal parenthesized names before Fusion suffix aliases", async () => {
+  add("Main", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
+  add("Main(high)", ["openai/literal"]);
+  expect((await chat({ model: "Main(high)" })).status).toBe(200);
+  expect(modelsCalled()).toEqual(["literal"]);
+  expect(mocks.core.mock.calls[0][0].reasoningIntent).toBeUndefined();
+});
+
+it.each([["fusion", "unknown"], ["fallback", "high"]])("does not reinterpret unsupported suffixes or generic combos (%s/%s)", async (fallbackStrategy, suffix) => {
+  add("Main", ["openai/panel"], { fallbackStrategy, judgeModel: "openai/judge" });
+  mocks.core.mockResolvedValue({ success: false, response: Response.json({ error: { message: "Unknown model" } }, { status: 400 }) });
+  expect((await chat({ model: `Main(${suffix})` })).status).toBe(400);
+  expect(modelsCalled()).toEqual([`Main(${suffix})`]);
+  expect(mocks.core.mock.calls[0][0].reasoningIntent).toBeUndefined();
+});
+
+it("routes nested Fusion suffix aliases without flattening their panels", async () => {
+  add("Main", ["Nested(8192)"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
+  add("Nested", ["openai/inner-panel"], { fallbackStrategy: "fusion", judgeModel: "openai/inner-judge" });
+  expect((await chat()).status).toBe(200);
+  const inner = mocks.core.mock.calls.map(([options]) => options).filter((options) => options.modelInfo.model.startsWith("inner-"));
+  expect(inner).toHaveLength(4);
+  for (const options of inner) expect(options.reasoningIntent).toMatchObject({ mode: "budget", budget: 8192 });
+});
+
 it("propagates only private generation ceilings into ChatCore", async () => {
   add("Main", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
   expect((await chat()).status).toBe(200);
