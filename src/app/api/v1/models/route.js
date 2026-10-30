@@ -7,7 +7,10 @@ import {
   isAnthropicCompatibleProvider,
   isOpenAICompatibleProvider,
 } from "@/shared/constants/providers";
-import { getProviderConnections, getCombos, getCustomModels, getModelAliases } from "@/lib/localDb";
+import { getProviderConnections, getCombos, getCustomModels, getModelAliases, getSettings } from "@/lib/localDb";
+import { getModelInfo } from "@/sse/services/model";
+import { getThinkingLevels } from "open-sse/providers/thinkingLevels.js";
+import { stripThinkingSuffix } from "open-sse/translator/concerns/thinkingUnified.js";
 import { getDisabledModels } from "@/lib/disabledModelsDb";
 import { getKeyAccessContext, filterModelsListForKey } from "@/sse/services/keyAccess.js";
 import { resolveKiroModels } from "open-sse/services/kiroModels.js";
@@ -20,7 +23,7 @@ import { resolveCursorModels } from "open-sse/services/cursorModels.js";
 import { resolveZedModels } from "open-sse/shared/zedAuth.js";
 import { updateProviderCredentials } from "@/sse/services/tokenRefresh";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
-import { capabilitiesFromServiceKind, getCapabilitiesForModel, aggregateComboCapabilities } from "open-sse/providers/capabilities.js";
+import { capabilitiesFromServiceKind, getCapabilitiesForModel, aggregateComboCapabilities, DEFAULT_CAPABILITIES } from "open-sse/providers/capabilities.js";
 
 // Qoder shares one live resolver across intl (qoder) and CN (qoder-cn); the
 // credentials carry the provider id so qoderModels picks the right region's
@@ -386,6 +389,42 @@ export async function buildModelsList(kindFilter, options = {}) {
   // Lookup map so aggregateComboCapabilities can recursively resolve nested combos
   const comboByName = Object.fromEntries(combos.map((c) => [c.name, c.models]));
 
+  let settings = {};
+  if (combos.length) {
+    try {
+      settings = await getSettings();
+    } catch {
+      console.log("Could not fetch combo settings");
+    }
+  }
+  const isFusion = (name) => (settings.comboStrategies?.[name]?.fallbackStrategy || settings.comboStrategy) === "fusion";
+  const reasoningCache = new Map();
+  // Ordinary adapters inherit their first member's reasoning contract, as in
+  // aggregateComboCapabilities. Fusion instead inherits its effective judge.
+  const resolveReasoning = async (target, path = new Set()) => {
+    if (typeof target !== "string" || !target || path.has(target)) return null;
+    const cached = reasoningCache.get(target);
+    if (cached) return path.size + cached.depth <= 32 ? cached : null;
+    const nested = combosByName.get(target);
+    let result;
+    if (nested) {
+      if (path.size >= 32) return null;
+      const first = nested.models?.[0];
+      const next = isFusion(target) ? settings.comboStrategies?.[target]?.judgeModel?.trim() || first : first;
+      const child = await resolveReasoning(next, new Set([...path, target]));
+      if (!child) return null;
+      result = { ...child, depth: child.depth + 1 };
+    } else {
+      // Only capability lookup strips suffixes; combo routing is unchanged.
+      const info = await getModelInfo(stripThinkingSuffix(target));
+      if (!info.provider) return null;
+      const model = stripThinkingSuffix(info.model);
+      result = { caps: getCapabilitiesForModel(info.provider, model), levels: getThinkingLevels(info.provider, model), depth: 0 };
+    }
+    reasoningCache.set(target, result);
+    return result;
+  };
+
   // Combos first (filtered by kind). Web combos expose `kind` so AI knows search vs fetch.
   for (const combo of combos) {
     if (!comboMatchesKinds(combo, kindFilter)) continue;
@@ -398,7 +437,17 @@ export async function buildModelsList(kindFilter, options = {}) {
       entry.kind = combo.kind;
     } else {
       const comboCaps = aggregateComboCapabilities(combo.models, comboByName, comboSeatCapabilities);
-      if (comboCaps) entry.capabilities = comboCaps;
+      if (isFusion(combo.name)) {
+        const judge = await resolveReasoning(combo.name);
+        const reasoning = judge?.caps || DEFAULT_CAPABILITIES;
+        entry.capabilities = { ...comboCaps };
+        for (const field of ["reasoning", "thinkingFormat", "thinkingCanDisable", "thinkingRange", "thinkingEffortSupported"]) {
+          entry.capabilities[field] = reasoning[field];
+        }
+        entry.capabilities.thinkingLevels = judge?.levels || null;
+      } else if (comboCaps) {
+        entry.capabilities = comboCaps;
+      }
       // Any seat can serve the request, so the only window a combo can promise is
       // its smallest. Combo entries were the only models on this endpoint that
       // published no limits at all, which leaves a client to guess from the name —

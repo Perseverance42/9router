@@ -6,6 +6,7 @@ const db = vi.hoisted(() => ({
   getCombos: vi.fn(),
   getCustomModels: vi.fn(async () => []),
   getModelAliases: vi.fn(async () => ({})),
+  getSettings: vi.fn(async () => ({})),
 }));
 
 vi.mock("@/lib/localDb", () => db);
