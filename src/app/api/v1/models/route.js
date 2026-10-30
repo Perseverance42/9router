@@ -8,7 +8,7 @@ import {
   isOpenAICompatibleProvider,
 } from "@/shared/constants/providers";
 import { getProviderConnections, getCombos, getCustomModels, getModelAliases, getSettings } from "@/lib/localDb";
-import { getModelInfo } from "@/sse/services/model";
+import { getModelInfo, resolveFusionTarget } from "@/sse/services/model";
 import { getThinkingLevels } from "open-sse/providers/thinkingLevels.js";
 import { stripThinkingSuffix } from "open-sse/translator/concerns/thinkingUnified.js";
 import { getDisabledModels } from "@/lib/disabledModelsDb";
@@ -402,7 +402,9 @@ export async function buildModelsList(kindFilter, options = {}) {
   // Ordinary adapters inherit their first member's reasoning contract, as in
   // aggregateComboCapabilities. Fusion instead inherits its effective judge.
   const resolveReasoning = async (target, path = new Set()) => {
-    if (typeof target !== "string" || !target || path.has(target)) return null;
+    if (typeof target !== "string" || !target) return null;
+    target = (await resolveFusionTarget(target, settings, (name) => combosByName.get(name), () => modelAliases)).model;
+    if (path.has(target)) return null;
     const cached = reasoningCache.get(target);
     if (cached) return path.size + cached.depth <= 32 ? cached : null;
     const nested = combosByName.get(target);

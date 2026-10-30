@@ -128,13 +128,53 @@ describe("/v1/models Fusion judge reasoning", () => {
     expect(model.capabilities.thinkingLevels).toBeNull();
   });
 
-  it("does not reinterpret a suffixed combo name as a judge combo", async () => {
+  it("does not reinterpret a suffixed generic fallback combo as a judge combo", async () => {
     const models = await advertise([
       { name: "Fusion", models: [panel] },
       { name: "Nested", models: [judge] },
     ], { Fusion: fusion("Nested(high)") });
     expect(models[0].capabilities.reasoning).toBe(false);
     expect(models[0].capabilities.thinkingLevels).toBeNull();
+  });
+
+  it.each([false, true])("normalizes nested Fusion judge suffixes before inference (global: %s)", async (global) => {
+    const models = await advertise([
+      { name: "Outer", models: [panel] },
+      { name: "Inner", models: [panel] },
+    ], global ? { Outer: { judgeModel: "Inner(high)" }, Inner: { judgeModel: judge } }
+      : { Outer: fusion("Inner(high)"), Inner: fusion(judge) }, global ? { comboStrategy: "fusion" } : {});
+    expect(models[0].capabilities).toMatchObject(expected("zai", "glm-5.2"));
+    expect(models[1].capabilities).toMatchObject(expected("zai", "glm-5.2"));
+  });
+
+  it("keeps an exact suffixed alias ahead of an existing bare Fusion combo", async () => {
+    db.getModelAliases.mockResolvedValue({ "Review(high)": { provider: "anthropic", model: "claude-sonnet-4" } });
+    const models = await advertise([
+      { name: "Outer", models: [panel] },
+      { name: "Review", models: [panel] },
+    ], { Outer: fusion("Review(high)"), Review: fusion(judge) });
+    expect(models[0].capabilities).toMatchObject(expected("anthropic", "claude-sonnet-4"));
+    expect(models[1].capabilities).toMatchObject(expected("zai", "glm-5.2"));
+  });
+
+  it("keeps a literal suffixed combo ahead of an exact alias", async () => {
+    db.getModelAliases.mockResolvedValue({ "Review(high)": { provider: "anthropic", model: "claude-sonnet-4" } });
+    const models = await advertise([
+      { name: "Outer", models: [panel] },
+      { name: "Review(high)", models: [judge] },
+      { name: "Review", models: [panel] },
+    ], { Outer: fusion("Review(high)"), Review: fusion(panel) });
+    expect(models[0].capabilities).toMatchObject(expected("zai", "glm-5.2"));
+  });
+
+  it("bounds normalized suffix cycles without leaking inferred leaf capabilities", async () => {
+    const models = await advertise([
+      { name: "A", models: [judge] }, { name: "B", models: [judge] },
+    ], { A: fusion("B(high)"), B: fusion("A(8192)") });
+    for (const model of models) {
+      expect(model.capabilities.reasoning).toBe(false);
+      expect(model.capabilities.thinkingLevels).toBeNull();
+    }
   });
 
   it("bounds judge cycles without leaking panel defaults", async () => {
@@ -149,9 +189,9 @@ describe("/v1/models Fusion judge reasoning", () => {
     }
   });
 
-  it.each([false, true])("bounds depth with cached subtrees: %s", async (cached) => {
+  it.each([[false, false], [true, false], [false, true], [true, true]])("bounds depth with cached subtrees: %s, suffixes: %s", async (cached, suffixed) => {
     const chain = Array.from({ length: 33 }, (_, i) => ({ name: `C${i}`, models: [panel] }));
-    const strategies = Object.fromEntries(chain.map((combo, i) => [combo.name, fusion(i === 32 ? judge : `C${i + 1}`)]));
+    const strategies = Object.fromEntries(chain.map((combo, i) => [combo.name, fusion(i === 32 ? judge : `C${i + 1}${suffixed ? "(high)" : ""}`)]));
     // Deepest-first populates the cache before the over-depth root.
     const models = await advertise(cached ? chain.toReversed() : chain, strategies);
     expect(models.find((model) => model.id === "C1").capabilities).toMatchObject(expected("zai", "glm-5.2"));

@@ -9,7 +9,7 @@ import {
 } from "../services/auth.js";
 import { handleAntigravityQuotaError, clearAntigravityStrikes } from "../services/antigravityQuota.js";
 import { getSettings } from "@/lib/localDb";
-import { getModelInfo, getComboModels } from "../services/model.js";
+import { getModelInfo, getComboModels, resolveFusionTarget } from "../services/model.js";
 import { captureThinking, parseSuffix } from "open-sse/translator/concerns/thinkingUnified.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
 import { DEFAULT_HEADROOM_URL } from "@/lib/headroom/detect";
@@ -183,16 +183,6 @@ export async function handleChat(request, clientRawRequest = null) {
   }
 
   return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null);
-}
-
-// Literal combo names win. Thinking suffixes are aliases only for Fusion, never fallback combos.
-async function resolveFusionTarget(model, settings) {
-  if (typeof model !== "string" || model.includes("/")) return { model };
-  const { cleanModel, override } = parseSuffix(model);
-  if (!override || await getComboModels(model, { allowEmpty: true })) return { model };
-  const strategy = settings.comboStrategies?.[cleanModel]?.fallbackStrategy || settings.comboStrategy || "fallback";
-  return strategy === "fusion" && await getComboModels(cleanModel, { allowEmpty: true })
-    ? { model: cleanModel, intent: override } : { model };
 }
 
 function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels, execution = {}) {

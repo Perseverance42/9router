@@ -1,10 +1,10 @@
 import { beforeEach, expect, it, vi } from "vitest";
 
-const fx = vi.hoisted(() => ({ combos: [], settings: {}, keys: {} }));
+const fx = vi.hoisted(() => ({ combos: [], settings: {}, keys: {}, aliases: {} }));
 const mocks = vi.hoisted(() => ({ core: vi.fn(), credentials: vi.fn(), refresh: vi.fn(), lookup: vi.fn(), systemone: vi.fn() }));
 vi.mock("@/lib/localDb", () => ({
   getSettings: async () => fx.settings,
-  getModelAliases: async () => ({}),
+  getModelAliases: async () => fx.aliases,
   getComboByName: mocks.lookup,
   getProviderNodes: async () => [],
   getCombos: async () => fx.combos,
@@ -50,6 +50,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   resetComboRotation();
   fx.combos = [];
+  fx.aliases = {};
   mocks.lookup.mockImplementation(async (name) => fx.combos.find((c) => c.name === name) || null);
   mocks.systemone.mockResolvedValue({ success: false });
   fx.keys = { key: { isActive: true, access: { restricted: false, allow: [] } } };
@@ -137,7 +138,20 @@ it("keeps configured concrete judge and panel modes when the caller has no inten
   for (const [options] of mocks.core.mock.calls) expect(options.reasoningIntent).toBeNull();
 });
 
-it("resolves literal parenthesized names before Fusion suffix aliases", async () => {
+it.each(["top", "panel", "judge"])("keeps exact suffixed aliases ahead of Fusion suffix interpretation (%s)", async (kind) => {
+  fx.aliases["Review(high)"] = { provider: "anthropic", model: "claude-sonnet-4" };
+  add("Review", ["openai/wrong-panel"], { fallbackStrategy: "fusion", judgeModel: "openai/wrong-judge" });
+  if (kind !== "top") add("Main", [kind === "panel" ? "Review(high)" : "openai/panel"], { fallbackStrategy: "fusion", judgeModel: kind === "judge" ? "Review(high)" : "openai/judge" });
+  expect((await chat({ model: kind === "top" ? "Review(high)" : "Main" })).status).toBe(200);
+  expect(modelsCalled()).toEqual(kind === "top" ? ["claude-sonnet-4"] : kind === "panel"
+    ? ["judge", "claude-sonnet-4", "judge", "judge"] : ["claude-sonnet-4", "panel", "claude-sonnet-4", "claude-sonnet-4"]);
+  const options = mocks.core.mock.calls.map(([options]) => options).find((options) => options.modelInfo.model === "claude-sonnet-4");
+  expect(options.modelInfo.provider).toBe("anthropic");
+  expect(options.reasoningIntent).toBe(kind === "top" ? undefined : null);
+});
+
+it("resolves literal parenthesized names before both aliases and Fusion suffix aliases", async () => {
+  fx.aliases["Main(high)"] = { provider: "anthropic", model: "claude-sonnet-4" };
   add("Main", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
   add("Main(high)", ["openai/literal"]);
   expect((await chat({ model: "Main(high)" })).status).toBe(200);
@@ -151,6 +165,14 @@ it.each([["fusion", "unknown"], ["fallback", "high"]])("does not reinterpret uns
   expect((await chat({ model: `Main(${suffix})` })).status).toBe(400);
   expect(modelsCalled()).toEqual([`Main(${suffix})`]);
   expect(mocks.core.mock.calls[0][0].reasoningIntent).toBeUndefined();
+});
+
+it("routes a suffixed nested Fusion judge to its actual provider", async () => {
+  add("Outer", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "Inner(high)" });
+  add("Inner", ["openai/inner-panel"], { fallbackStrategy: "fusion", judgeModel: "zai/glm-5.2" });
+  expect((await chat({ model: "Outer" })).status).toBe(200);
+  expect(mocks.core.mock.calls.some(([options]) => options.modelInfo.provider === "zai" && options.modelInfo.model === "glm-5.2")).toBe(true);
+  expect(modelsCalled()).not.toContain("Inner(high)");
 });
 
 it("routes nested Fusion suffix aliases without flattening their panels", async () => {

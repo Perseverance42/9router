@@ -2,6 +2,7 @@
 import { getModelAliases, getComboByName, getProviderNodes } from "@/lib/localDb";
 import { parseModel as parseModelCore, resolveModelAliasFromMap, getModelInfoCore } from "open-sse/services/model.js";
 import REGISTRY from "open-sse/providers/registry/index.js";
+import { parseSuffix } from "open-sse/translator/concerns/thinkingUnified.js";
 
 // Local provider alias overrides (HMR-friendly, applied on top of open-sse map)
 const LOCAL_PROVIDER_ALIASES = {
@@ -91,4 +92,14 @@ export async function getComboModels(modelStr, { allowEmpty = false } = {}) {
     return combo.models;
   }
   return null;
+}
+
+// Resolve only Fusion's logical thinking suffixes. Exact combos and aliases retain normal precedence.
+export async function resolveFusionTarget(model, settings, comboLookup = getComboByName, aliasesLookup = getModelAliases) {
+  if (typeof model !== "string" || model.includes("/")) return { model };
+  const { cleanModel, override } = parseSuffix(model);
+  if (!override || await comboLookup(model) || Object.hasOwn(await aliasesLookup(), model)) return { model };
+  const strategy = settings.comboStrategies?.[cleanModel]?.fallbackStrategy || settings.comboStrategy || "fallback";
+  return strategy === "fusion" && await comboLookup(cleanModel)
+    ? { model: cleanModel, intent: override } : { model };
 }
