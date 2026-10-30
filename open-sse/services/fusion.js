@@ -1,7 +1,8 @@
 import { randomInt } from "node:crypto";
 import { FORMATS } from "../translator/formats.js";
 import { ROLE, CLAUDE_BLOCK } from "../translator/schema/index.js";
-import { extractReasoningText } from "../translator/concerns/reasoning.js";
+import { getCapabilitiesForModel } from "../providers/capabilities.js";
+import { parseModel } from "./model.js";
 import { translateRequest } from "../translator/index.js";
 import { detectFormat } from "./provider.js";
 import { deliverFusionCompletion } from "./fusionOutput.js";
@@ -10,6 +11,8 @@ import {
   FUSION_TOOL_NAME, FUSION_ANALYST_SCHEMA, FUSION_ANALYST_MAX_TOKENS,
   FUSION_ANALYST_INSTRUCTIONS, FUSION_SYNTHESIS_INSTRUCTIONS, FUSION_CONSULT_PARAMETERS,
   FUSION_TOOL_STATUS_INSTRUCTIONS, resolveFusionPolicy, validateFusionSelection, validateFusionAnalysis,
+  FUSION_CONTEXT_ALLOWANCE, FUSION_PANEL_MAX_TOKENS, FUSION_CONSULT_MAX_TOKENS,
+  FUSION_PANEL_INSTRUCTIONS, FUSION_TIGHT_PANEL_INSTRUCTIONS, FUSION_SUMMARY_INSTRUCTIONS,
 } from "../config/fusion.js";
 
 class FusionError extends Error {
@@ -86,6 +89,11 @@ function canonicalRequest(body, sourceFormat, internal) {
   const copy = structuredClone(body);
   const canonical = translateRequest(sourceFormat, FORMATS.OPENAI, body.model, copy, false);
   if (!canonical || !Array.isArray(canonical.messages)) throw new FusionError("Unsupported Fusion conversation format", "preflight", {}, 400);
+  for (const key of ["max_tokens", "max_completion_tokens"]) {
+    if (canonical[key] !== undefined && (!Number.isInteger(canonical[key]) || canonical[key] <= 0)) {
+      throw new FusionError("Fusion output limits must be positive integers", "preflight", {}, 400);
+    }
+  }
   if (toolStatuses.length) addInstruction(canonical, `${FUSION_TOOL_STATUS_INSTRUCTIONS}\n${JSON.stringify(toolStatuses)}`);
   if (canonical.n !== undefined && canonical.n !== 1) throw new FusionError("Fusion supports one completion per request", "preflight", {}, 400);
   // Responses format constraints are public constraints, not analyst output settings.
@@ -138,7 +146,7 @@ function candidate(completion, tools, constraints = {}, validators = new Map()) 
     if (!names.has(name)) issues.push(`Unknown application tool: ${name || "missing name"}`);
     const validate = validators.get(name);
     if (validate && !validate(args)) issues.push(`Invalid arguments for ${name}: ${JSON.stringify(validate.errors)}`);
-    return { name, arguments: args };
+    return { name, arguments: args, ...(typeof raw === "string" ? { arguments_json: raw } : {}) };
   });
   if (constraints.tool_choice === "none" && calls.length) issues.push("Tools are disabled by the client");
   if (constraints.parallel_tool_calls === false && calls.length > 1) issues.push("Parallel calls are disabled by the client");
@@ -147,7 +155,6 @@ function candidate(completion, tools, constraints = {}, validators = new Map()) 
   return {
     content: message.content ?? null,
     tool_calls: calls,
-    reasoning: extractReasoningText(message) || null,
     refusal: message.refusal || null,
     finish_reason: choice.finish_reason || null,
     issues,
@@ -163,8 +170,38 @@ function anonymize(responses) {
   return shuffled.map((response, i) => ({ id: `response_${i + 1}`, ...response }));
 }
 
+// Text-only estimate, not a tokenizer. Media payloads have provider-specific costs.
+export function estimateFusionRequest(request) {
+  let mediaEstimationUnsupported = false;
+  const text = JSON.stringify(request, function (key, value) {
+    if (key === "input_audio" && value && typeof value.data === "string") {
+      mediaEstimationUnsupported = true;
+      return { ...value, data: "[media: estimation unsupported]" };
+    }
+    if ((key === "data" && typeof value === "string" && this.type === "base64") || (key === "url" && typeof value === "string" && /^data:[^,]*;base64,/.test(value))) {
+      mediaEstimationUnsupported = true;
+      return "[media: estimation unsupported]";
+    }
+    if (value && typeof value === "object" && ["image_url", "input_audio", "video_url", "image", "audio", "file"].includes(value.type)) mediaEstimationUnsupported = true;
+    return value;
+  });
+  return { tokens: Math.ceil(Buffer.byteLength(text, "utf8") / 3) + 32 + (request.messages?.length || 0) * 8, mediaEstimationUnsupported };
+}
+
+const positive = (value) => Number.isInteger(value) && value > 0;
+const explicitOutput = (request) => positive(request.max_completion_tokens) ? request.max_completion_tokens
+  : positive(request.max_tokens) ? request.max_tokens : undefined;
+// ponytail: provider defaults vary; reserve at most 8192 until routing exposes actual translated output/reasoning defaults.
+const outputReserve = (request, limits) => explicitOutput(request) ?? Math.min(limits.maxOutput, 8192);
+function capOutput(request, cap) {
+  const value = Math.max(1, Math.floor(Math.min(explicitOutput(request) ?? cap, cap)));
+  request.max_tokens = value;
+  if (request.max_completion_tokens !== undefined) request.max_completion_tokens = value;
+}
+const budgetError = (stage) => new FusionError("Fusion request exceeds the safe context budget", stage, { code: "fusion_context_budget" }, 400);
+
 /** One bounded consultation: initial controller, parallel panel, analyst, native synthesis. */
-export async function handleFusionChat({ body, models, handleSingleModel, log, judgeModel, tuning, signal, sourceFormat = detectFormat(body), outputFormat = sourceFormat, internal = false, preflight }) {
+export async function handleFusionChat({ body, models, handleSingleModel, log, judgeModel, tuning, signal, sourceFormat = detectFormat(body), outputFormat = sourceFormat, internal = false, preflight, getModelLimits }) {
   const controller = new AbortController();
   const onAbort = () => controller.abort(signal.reason);
   if (signal?.aborted) onAbort();
@@ -172,7 +209,27 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
   let stage = "preflight";
   let handedOff = false;
   const checkAbort = () => controller.signal.throwIfAborted();
+  const limitCache = new Map();
+  const limitsFor = async (model) => {
+    if (!limitCache.has(model)) limitCache.set(model, (async () => {
+      const parsed = parseModel(model);
+      // ponytail: unknown/local models inherit capability heuristics; use getModelLimits for configured limits.
+      const fallback = getCapabilitiesForModel(parsed.provider, parsed.model);
+      const resolved = await abortable(() => getModelLimits?.(model), controller.signal);
+      return {
+        contextWindow: positive(resolved?.contextWindow) ? resolved.contextWindow : fallback.contextWindow,
+        maxOutput: positive(resolved?.maxOutput) ? resolved.maxOutput : fallback.maxOutput,
+      };
+    })());
+    return limitCache.get(model);
+  };
+  const fits = async (request, model, extra = 0) => {
+    const limits = await limitsFor(model);
+    return estimateFusionRequest(request).tokens + outputReserve(request, limits) + extra <= Math.floor(limits.contextWindow * FUSION_CONTEXT_ALLOWANCE);
+  };
   const invoke = async (request, model, callStage, outputFormat = FORMATS.OPENAI) => {
+    checkAbort();
+    if (!await fits(request, model)) throw budgetError(callStage);
     checkAbort();
     let response;
     try {
@@ -255,6 +312,8 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
       ? { type: "function", function: { name: consultToolName } }
       : (policy.maxPanels === 0 ? original.tool_choice : "auto");
     if (policy.maxPanels > 0) delete initial.response_format;
+    // Optional consultation can return a public answer; do not cap that direct path.
+    if (policy.minPanels > 0) capOutput(initial, Math.min(FUSION_CONSULT_MAX_TOKENS, (await limitsFor(judge)).maxOutput));
     stage = "initial";
     const first = await complete(initial, judge, stage);
     if (["length", "max_tokens"].includes(first.choices[0].finish_reason)) throw new FusionError("Initial judge completion was truncated", stage);
@@ -275,11 +334,28 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
     try { selected = validateFusionSelection(args, policy); }
     catch (error) { throw new FusionError(error.message, stage); }
     stage = "panel";
+    const judgeLimits = await limitsFor(judge);
+    const synthesisBase = structuredClone(original);
+    addInstruction(synthesisBase, FUSION_SYNTHESIS_INSTRUCTIONS);
+    const contextBase = { brief: args.brief, participation: { minPanels: policy.minPanels, maxPanels: policy.maxPanels, selectedPanels: selected.length }, responses: [] };
+    synthesisBase.messages.push(advisory(contextBase));
+    const analysisCap = Math.min(FUSION_ANALYST_MAX_TOKENS, judgeLimits.maxOutput);
+    const sharedAdvisoryBudget = Math.floor(judgeLimits.contextWindow * FUSION_CONTEXT_ALLOWANCE)
+      - estimateFusionRequest(synthesisBase).tokens - outputReserve(original, judgeLimits) - analysisCap;
+    if (sharedAdvisoryBudget <= 0) throw budgetError(stage);
+    const panelCaps = await Promise.all(selected.map(async ({ model }) => Math.min(
+      FUSION_PANEL_MAX_TOKENS, (await limitsFor(model)).maxOutput, explicitOutput(original) ?? Infinity,
+      Math.floor(sharedAdvisoryBudget / selected.length),
+    )));
+    if (panelCaps.some((cap) => cap < 1)) throw budgetError(stage);
+    const tight = sharedAdvisoryBudget < selected.length * FUSION_PANEL_MAX_TOKENS;
     // Start every slot before awaiting any result. The first causal error aborts siblings.
-    const pending = selected.map(async (slot) => {
+    const pending = selected.map(async (slot, index) => {
       try {
         const request = structuredClone(base);
-        addInstruction(request, "Panel responses are advisory; propose application actions without executing them.");
+        capOutput(request, panelCaps[index]);
+        addInstruction(request, FUSION_PANEL_INSTRUCTIONS);
+        if (tight) addInstruction(request, FUSION_TIGHT_PANEL_INSTRUCTIONS);
         request.messages.push(advisory({ consultation_brief: args.brief }));
         const completion = await complete(request, slot.model, "panel");
         return candidate(completion, publicTools, original, validators);
@@ -300,18 +376,65 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
     stage = "analyst";
     const analysisRequest = {
       messages: [instruction(FUSION_ANALYST_INSTRUCTIONS), advisory(context)],
-      stream: false, max_tokens: FUSION_ANALYST_MAX_TOKENS,
+      stream: false, max_tokens: analysisCap,
       response_format: { type: "json_schema", json_schema: { name: "fusion_analysis", strict: false, schema: FUSION_ANALYST_SCHEMA } },
     };
+    const prospective = structuredClone(synthesisBase);
+    prospective.messages[prospective.messages.length - 1] = advisory(context);
+    const needsSummaries = !await fits(prospective, judge, analysisCap);
+    let summaryIds = [];
+    let summaryBudget = 0;
+    if (needsSummaries) {
+      // Structured output and technical action payloads are immutable, not prose.
+      const prose = (response) => {
+        if (["json_schema", "json_object"].includes(answerFormat?.type)
+          || typeof response.content !== "string" || !response.content.length) return false;
+        try {
+          const value = JSON.parse(response.content);
+          if (value && typeof value === "object") return false;
+        } catch { /* ordinary prose */ }
+        return true;
+      };
+      summaryIds = responses.filter(prose).map(({ id }) => id);
+      const immutable = { ...context, responses: responses.map((response) => prose(response) ? { ...response, content: "" } : response) };
+      const minimum = structuredClone(synthesisBase);
+      minimum.messages[minimum.messages.length - 1] = advisory(immutable);
+      summaryBudget = Math.floor(judgeLimits.contextWindow * FUSION_CONTEXT_ALLOWANCE)
+        - estimateFusionRequest(minimum).tokens - outputReserve(original, judgeLimits) - analysisCap;
+      if (!summaryIds.length || summaryBudget <= 0) throw budgetError(stage);
+      const schema = structuredClone(FUSION_ANALYST_SCHEMA);
+      schema.required.push("panel_summaries");
+      schema.properties.panel_summaries = {
+        type: "object", additionalProperties: false, required: summaryIds,
+        properties: Object.fromEntries(summaryIds.map((id) => [id, { type: "string", minLength: 1, maxLength: summaryBudget * 3 }])),
+      };
+      analysisRequest.response_format.json_schema.schema = schema;
+      addInstruction(analysisRequest, `${FUSION_SUMMARY_INSTRUCTIONS}\nSummarize only these response IDs: ${JSON.stringify(summaryIds)}. Shared summary token budget: ${summaryBudget}.`);
+    }
     const evaluated = await complete(analysisRequest, judge, stage);
     if (["length", "max_tokens", "content_filter"].includes(evaluated.choices[0].finish_reason) || evaluated.choices[0].message.refusal) {
+      if (needsSummaries) throw budgetError(stage);
       throw new FusionError("Analyst did not complete a valid evaluation", stage);
     }
     let analysis;
     try {
-      analysis = validateFusionAnalysis(JSON.parse(evaluated.choices[0].message.content), responses.map(({ id }) => id));
+      const value = JSON.parse(evaluated.choices[0].message.content);
+      if (needsSummaries) {
+        const summaries = value.panel_summaries;
+        if (!summaries || typeof summaries !== "object" || Array.isArray(summaries)
+          || Object.keys(summaries).length !== summaryIds.length
+          || summaryIds.some((id) => typeof summaries[id] !== "string" || !summaries[id].trim())
+          || estimateFusionRequest(summaries).tokens > summaryBudget) throw budgetError(stage);
+        for (const response of responses) if (summaryIds.includes(response.id)) response.content = summaries[response.id];
+        delete value.panel_summaries;
+      }
+      analysis = validateFusionAnalysis(value, responses.map(({ id }) => id));
       if (evaluated.choices[0].message.tool_calls?.length) throw new Error("Analyst must not call tools");
-    } catch (error) { throw new FusionError(`Invalid Fusion analysis: ${error.message}`, stage); }
+    } catch (error) {
+      if (error instanceof FusionError) throw error;
+      if (needsSummaries) throw budgetError(stage);
+      throw new FusionError(`Invalid Fusion analysis: ${error.message}`, stage);
+    }
     stage = "synthesis";
     const synthesis = structuredClone(original);
     synthesis.stream = body.stream === true;

@@ -189,6 +189,26 @@ function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAcce
     sourceFormat: execution.sourceFormat || (request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) || undefined : undefined),
     outputFormat: execution.outputFormat,
     internal: execution.internal,
+    getModelLimits: async (target) => {
+      const visit = async (model, path = []) => {
+        if (path.includes(model) || path.length >= 32) throw new Error("Invalid Fusion model limits");
+        const info = await getModelInfo(model);
+        if (info.provider) return getCapabilitiesForModel(info.provider, info.model);
+        const children = await getComboModels(model, { allowEmpty: true });
+        const settings = await getSettings();
+        const config = settings.comboStrategies?.[model] || {};
+        const judge = (config.fallbackStrategy || settings.comboStrategy) === "fusion" ? config.judgeModel?.trim() || children?.[0] : null;
+        const members = [...new Set([...(children || []), ...(judge ? [judge] : [])])];
+        if (!members.length) throw new Error("Invalid Fusion model limits");
+        const limits = await Promise.all(members.map((child) => visit(child, [...path, model])));
+        // One logical combo output: conservative ceilings, never a sum of seat outputs.
+        return {
+          contextWindow: Math.min(...limits.map((limit) => limit.contextWindow)),
+          maxOutput: Math.min(...limits.map((limit) => limit.maxOutput)),
+        };
+      };
+      return visit(target);
+    },
     // The outer Fusion checks the entire reachable graph, including nested judges,
     // before dispatch. Runtime routing keeps each combo as one logical target.
     preflight: execution.internal ? undefined : async (models, canonical) => {

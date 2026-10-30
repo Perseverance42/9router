@@ -9,6 +9,7 @@ const SAFE_ERRORS = Object.freeze({
   fusion_invalid_stream: ["Fusion synthesis returned invalid SSE framing", true],
   fusion_upstream_error: ["Fusion upstream model call failed", true],
   fusion_aborted: ["Fusion request cancelled", false],
+  fusion_context_budget: ["Fusion request exceeds the safe context budget", false],
   fusion_tool_output_truncated: ["Fusion synthesis tool output was truncated", true],
   fusion_tool_constraints: ["Fusion action violates client tool constraints", false],
   fusion_invalid_tool_calls: ["Fusion returned invalid application tool calls", false],

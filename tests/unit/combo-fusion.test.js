@@ -114,7 +114,7 @@ describe("Fusion controller", () => {
     expect(fn.mock.calls.every(([, , e]) => e.signal.aborted)).toBe(true);
   });
 
-  it("passes tool-only, malformed candidate arguments and exposed reasoning to evaluation", async () => {
+  it("passes tool-only and malformed candidate arguments without provider reasoning to evaluation", async () => {
     let data;
     const fn = vi.fn(async (_b, _m, { stage }) => {
       if (stage === "initial") return consult();
@@ -123,7 +123,7 @@ describe("Fusion controller", () => {
       return response({ content: "Cannot diagnose yet" });
     });
     expect((await run(fn)).ok).toBe(true);
-    expect(data).toContain("Visible summary");
+    expect(data).not.toContain("Visible summary");
     expect(data).toContain("Invalid JSON arguments");
     expect(data).not.toContain("p/a");
   });

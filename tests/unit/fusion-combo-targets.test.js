@@ -109,6 +109,15 @@ it.each(["fallback", "round-robin"])("keeps a combo panel as one slot with its %
   expect(initial).not.toContain("panel_2:");
 });
 
+it("resolves short model limits within a logical combo seat before panel dispatch", async () => {
+  add("Main", ["Panel"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
+  add("Panel", ["openai/gpt-3.5-turbo"]);
+  const response = await chat({ messages: [{ role: "user", content: "h".repeat(40000) }] });
+  expect(response.status).toBe(400);
+  expect((await response.json()).error).toMatchObject({ code: "fusion_context_budget", details: { stage: "panel", retryable: false } });
+  expect(modelsCalled()).toEqual(["judge"]);
+});
+
 it.each(["fallback", "round-robin"])("routes all judge stages through its combo's %s strategy", async (strategy) => {
   add("Main", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "Judge" });
   add("Judge", ["openai/judge-bad", "openai/judge-good"], { fallbackStrategy: strategy });
