@@ -188,6 +188,67 @@ describe("wire completion normalization through registered translators and Fusio
     rejected(await run(data(chat({ content: "Hello" })) + data(chat({}, "length")) + done, FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES));
   });
 
+  for (const upstream of [FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.ANTIGRAVITY, FORMATS.VERTEX]) {
+    // The Gemini-family translator accepts native and response-wrapped envelopes.
+    const gemini = (reason, tool = false) => {
+      const response = {
+        candidates: [{ content: { role: "model", parts: tool
+          ? [{ functionCall: { name: "lookup", args: { city: "Paris" } } }]
+          : [{ text: "Answer" }] }, ...(reason ? { finishReason: reason } : {}) }],
+        usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 3, totalTokenCount: 5 },
+      };
+      return data([FORMATS.GEMINI_CLI, FORMATS.ANTIGRAVITY].includes(upstream) ? { response } : response);
+    };
+    for (const output of [FORMATS.OPENAI, FORMATS.CLAUDE, FORMATS.OPENAI_RESPONSES]) {
+      const terminal = output === FORMATS.OPENAI ? done : output === FORMATS.CLAUDE ? '"type":"message_stop"' : '"type":"response.completed"';
+      for (const tool of [false, true]) {
+        it(`accepts ${upstream} STOP ${tool ? "tool" : "text"} completion as ${output}`, async () => {
+          const callback = vi.fn();
+          const result = await run(gemini("STOP", tool), upstream, output, false, callback);
+          accepted(result, tool);
+          expect(result.text.split(terminal)).toHaveLength(2);
+          expect(result.text.indexOf(tool ? "Paris" : "Answer")).toBeLessThan(result.text.indexOf(terminal));
+          expect(callback).toHaveBeenCalledTimes(1);
+          expect(callback.mock.calls[0][1]).toMatchObject(output === FORMATS.CLAUDE
+            ? { input_tokens: 2, output_tokens: 3 } : { prompt_tokens: 2, completion_tokens: 3 });
+        });
+      }
+      it(`preserves ${upstream} MAX_TOKENS semantics as ${output}`, async () => {
+        const result = await run(gemini("MAX_TOKENS"), upstream, output);
+        if (output === FORMATS.OPENAI_RESPONSES) {
+          rejected(result);
+          expect(result.text).not.toContain(terminal);
+        } else {
+          accepted(result);
+          expect(result.text).toContain(output === FORMATS.OPENAI ? '"finish_reason":"length"' : '"stop_reason":"max_tokens"');
+          expect(result.text).toContain(terminal);
+        }
+        const tool = await run(gemini("MAX_TOKENS", true), upstream, output);
+        expect(tool.validate).not.toHaveBeenCalled();
+        expect(tool.abort.signal.aborted).toBe(true);
+      });
+      it(`rejects missing or failed ${upstream} completion as ${output}`, async () => {
+        for (const reason of [undefined, "MALFORMED_FUNCTION_CALL", "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "OTHER", "FINISH_REASON_UNSPECIFIED"]) {
+          const result = await run(gemini(reason) + done, upstream, output);
+          rejected(result);
+          expect(result.text).not.toContain(terminal);
+        }
+        // A later STOP must not turn an explicit failure or error into success.
+        rejected(await run(gemini("MALFORMED_FUNCTION_CALL") + gemini("STOP"), upstream, output));
+        rejected(await run(data({ response: { error: { message: "failed" } } }) + gemini("STOP"), upstream, output));
+      });
+    }
+  }
+  for (const upstream of [FORMATS.OPENAI, FORMATS.CLAUDE, FORMATS.OPENAI_RESPONSES]) {
+    it(`does not authorize ${upstream} using foreign Gemini completion evidence`, async () => {
+      const foreign = data({ candidates: [{ finishReason: "STOP" }] });
+      const partial = upstream === FORMATS.OPENAI ? data(chat({ content: "Hello" }))
+        : upstream === FORMATS.CLAUDE ? claude().slice(0, -1).map(frame).join("")
+        : responses().slice(0, -1).map(frame).join("");
+      rejected(await run(partial + foreign, upstream));
+    });
+  }
+
   for (const output of [FORMATS.OPENAI, FORMATS.CLAUDE, FORMATS.OPENAI_RESPONSES]) {
     it(`requires Ollama done:true for ${output}`, async () => {
       const partial = JSON.stringify({ model: "test", message: { role: "assistant", content: "Hello" }, done: false }) + "\n\n";

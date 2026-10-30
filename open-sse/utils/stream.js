@@ -166,6 +166,18 @@ export function createSSEStream(options = {}) {
       return;
     }
     if (targetFormat === FORMATS.OLLAMA && parsed.done === true) upstreamCompleted = true;
+    if ([FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.ANTIGRAVITY, FORMATS.VERTEX].includes(targetFormat)) {
+      // Match the Gemini translator's native/response envelopes, not its fallback
+      // mapping of unknown finish reasons to stop. Only these are complete turns.
+      const response = parsed.response || parsed;
+      if (response.error) upstreamInvalid = true;
+      const reason = response.candidates?.[0]?.finishReason;
+      if (reason) {
+        if (reason === "STOP" || reason === "MAX_TOKENS") upstreamCompleted = true;
+        else upstreamInvalid = true;
+        if (reason === "MAX_TOKENS" && sourceFormat === FORMATS.OPENAI_RESPONSES) upstreamInvalid = true;
+      }
+    }
     if (parsed.type === "message_start" && parsed.message?.id) upstreamStarted = true;
     if (sourceFormat === FORMATS.OPENAI_RESPONSES &&
         ["length", "content_filter", "max_tokens"].includes(parsed.choices?.[0]?.finish_reason || parsed.delta?.stop_reason || parsed.done_reason)) upstreamInvalid = true;
