@@ -25,7 +25,7 @@ const STAGES = ["preflight", "initial", "panel", "analyst", "synthesis"];
 export function safeFusionError(error, stage = "synthesis", fallback = "fusion_upstream_error", upstreamStatus) {
   stage = STAGES.includes(stage) ? stage : "synthesis";
   const known = error?.type === "fusion_error" && typeof error.code === "string" && Object.hasOwn(SAFE_ERRORS, error.code);
-  const code = known ? error.code : fallback;
+  const code = known ? error.code : typeof fallback === "string" && Object.hasOwn(SAFE_ERRORS, fallback) ? fallback : "fusion_upstream_error";
   const [message, retryable] = SAFE_ERRORS[code];
   const status = error?.details?.upstream_status;
   const validStatus = (value) => Number.isInteger(value) && value >= 100 && value <= 599;
@@ -59,59 +59,67 @@ export function guardFusionStream(response, { sourceFormat, validate, signal, ab
   let holding = false;
   let terminal = false;
   let truncated = false;
+  let cancelled = false;
   const callAt = (index) => {
     if (!calls.has(index)) calls.set(index, { type: "function", function: { name: "", arguments: "" } });
     return calls.get(index);
   };
   const inspect = (frame) => {
-    for (const line of frame.split("\n")) {
-      if (!line.startsWith("data:")) {
-        if (line && !/^(?:event:|id:|retry:|:)/.test(line)) throw streamFailure("fusion_invalid_stream");
-        continue;
+    // SSE ignores unknown fields and joins data lines with a newline.
+    const data = frame.split("\n").filter((line) => line === "data" || line.startsWith("data:"))
+      .map((line) => line.slice(5).replace(/^ /, "")).join("\n").trim();
+    if (!data) return;
+    if (data === "[DONE]") { holding = true; terminal = true; return; }
+    let event;
+    try { event = JSON.parse(data); } catch { throw streamFailure("fusion_invalid_stream"); }
+    if (!event || typeof event !== "object" || Array.isArray(event)) throw streamFailure("fusion_invalid_stream");
+    if (event.error || event.type === RESPONSES_EVENT.FAILED || event.type === "error"
+      || /^event:\s*(?:error|response\.failed)\s*$/m.test(frame)) {
+      throw streamFailure("fusion_upstream_error", event.error || event.response?.error || event);
+    }
+    // ponytail: validate the format envelope, not every provider-specific delta;
+    // extend the event families here when a new public streaming event is added.
+    const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+    const valid = sourceFormat === FORMATS.OPENAI
+      ? (Array.isArray(event.choices) && event.choices.length
+        ? event.choices.every((choice) => object(choice) && object(choice.delta))
+        : (event.choices === undefined || Array.isArray(event.choices)) && object(event.usage))
+      : sourceFormat === FORMATS.CLAUDE
+        ? ["ping", "message_start", "message_delta", "message_stop", "content_block_start", "content_block_delta", "content_block_stop"].includes(event.type)
+        : typeof event.type === "string" && /^response\.(?:created|in_progress|queued|completed|incomplete|usage|output_item|content_part|output_text|refusal|function_call_arguments|custom_tool_call_input|reasoning_summary_text|reasoning_text|reasoning_summary_part|file_search_call|web_search_call|code_interpreter_call|image_generation_call|mcp_call|mcp_call_arguments|mcp_list_tools)(?:\.|$)/.test(event.type);
+    if (!valid) throw streamFailure("fusion_invalid_stream");
+    if (event.type === CLAUDE_EVENT.MESSAGE_STOP || event.type === RESPONSES_EVENT.COMPLETED || event.type === RESPONSES_EVENT.INCOMPLETE) terminal = true;
+    const finish = event.choices?.[0]?.finish_reason || event.delta?.stop_reason;
+    if (["length", "max_tokens", "content_filter"].includes(finish) || event.type === RESPONSES_EVENT.INCOMPLETE) truncated = true;
+    if (event.choices?.some((choice) => choice.finish_reason)
+      || [CLAUDE_EVENT.MESSAGE_DELTA, CLAUDE_EVENT.MESSAGE_STOP, RESPONSES_EVENT.COMPLETED, RESPONSES_EVENT.INCOMPLETE, RESPONSES_EVENT.FAILED].includes(event.type)) holding = true;
+    if (sourceFormat === FORMATS.OPENAI) {
+      for (const part of event.choices?.[0]?.delta?.tool_calls || []) {
+        holding = true;
+        const call = callAt(part.index ?? 0);
+        if (part.id) call.id = part.id;
+        call.function.name += part.function?.name || "";
+        call.function.arguments += part.function?.arguments || "";
       }
-      const data = line.slice(5).trim();
-      if (!data) continue;
-      if (data === "[DONE]") { holding = true; terminal = true; continue; }
-      let event;
-      try { event = JSON.parse(data); } catch { throw streamFailure("fusion_invalid_stream"); }
-      if (!event || typeof event !== "object" || Array.isArray(event)) throw streamFailure("fusion_invalid_stream");
-      if (event.error || event.type === RESPONSES_EVENT.FAILED || event.type === "error"
-        || /^event:\s*(?:error|response\.failed)\s*$/m.test(frame)) {
-        throw streamFailure("fusion_upstream_error", event.error || event.response?.error || event);
+    } else if (sourceFormat === FORMATS.CLAUDE) {
+      if (event.type === CLAUDE_EVENT.CONTENT_BLOCK_START && event.content_block?.type === CLAUDE_BLOCK.TOOL_USE) {
+        holding = true;
+        const call = callAt(event.index);
+        call.id = event.content_block.id;
+        call.function.name = event.content_block.name;
+        if (Object.keys(event.content_block.input || {}).length) call.function.arguments = JSON.stringify(event.content_block.input);
       }
-      if (event.type === CLAUDE_EVENT.MESSAGE_STOP || event.type === RESPONSES_EVENT.COMPLETED || event.type === RESPONSES_EVENT.INCOMPLETE) terminal = true;
-      const finish = event.choices?.[0]?.finish_reason || event.delta?.stop_reason;
-      if (["length", "max_tokens", "content_filter"].includes(finish) || event.type === RESPONSES_EVENT.INCOMPLETE) truncated = true;
-      if (event.choices?.some((choice) => choice.finish_reason)
-        || [CLAUDE_EVENT.MESSAGE_DELTA, CLAUDE_EVENT.MESSAGE_STOP, RESPONSES_EVENT.COMPLETED, RESPONSES_EVENT.INCOMPLETE, RESPONSES_EVENT.FAILED].includes(event.type)) holding = true;
-      if (sourceFormat === FORMATS.OPENAI) {
-        for (const part of event.choices?.[0]?.delta?.tool_calls || []) {
-          holding = true;
-          const call = callAt(part.index ?? 0);
-          if (part.id) call.id = part.id;
-          call.function.name += part.function?.name || "";
-          call.function.arguments += part.function?.arguments || "";
-        }
-      } else if (sourceFormat === FORMATS.CLAUDE) {
-        if (event.type === CLAUDE_EVENT.CONTENT_BLOCK_START && event.content_block?.type === CLAUDE_BLOCK.TOOL_USE) {
-          holding = true;
-          const call = callAt(event.index);
-          call.id = event.content_block.id;
-          call.function.name = event.content_block.name;
-          if (Object.keys(event.content_block.input || {}).length) call.function.arguments = JSON.stringify(event.content_block.input);
-        }
-        if (event.delta?.type === CLAUDE_DELTA.INPUT_JSON) callAt(event.index).function.arguments += event.delta.partial_json || "";
-      } else {
-        if (event.type === RESPONSES_EVENT.OUTPUT_ITEM_ADDED && event.item?.type === RESPONSES_ITEM.FUNCTION_CALL) {
-          holding = true;
-          const call = callAt(event.output_index);
-          call.id = event.item.call_id;
-          call.function.name = event.item.name;
-          call.function.arguments = event.item.arguments || "";
-        }
-        if (event.type === RESPONSES_EVENT.FUNCTION_CALL_ARGUMENTS_DELTA) callAt(event.output_index).function.arguments += event.delta || "";
-        if (event.type === RESPONSES_EVENT.FUNCTION_CALL_ARGUMENTS_DONE) callAt(event.output_index).function.arguments = event.arguments;
+      if (event.delta?.type === CLAUDE_DELTA.INPUT_JSON) callAt(event.index).function.arguments += event.delta.partial_json || "";
+    } else {
+      if (event.type === RESPONSES_EVENT.OUTPUT_ITEM_ADDED && event.item?.type === RESPONSES_ITEM.FUNCTION_CALL) {
+        holding = true;
+        const call = callAt(event.output_index);
+        call.id = event.item.call_id;
+        call.function.name = event.item.name;
+        call.function.arguments = event.item.arguments || "";
       }
+      if (event.type === RESPONSES_EVENT.FUNCTION_CALL_ARGUMENTS_DELTA) callAt(event.output_index).function.arguments += event.delta || "";
+      if (event.type === RESPONSES_EVENT.FUNCTION_CALL_ARGUMENTS_DONE) callAt(event.output_index).function.arguments = event.arguments;
     }
   };
   return new Response(new ReadableStream({
@@ -121,6 +129,7 @@ export function guardFusionStream(response, { sourceFormat, validate, signal, ab
           signal.throwIfAborted();
           let emitted = false;
           const { done, value } = await reader.read();
+          if (cancelled) return;
           signal.throwIfAborted();
           buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
           buffer = buffer.replace(/\r\n/g, "\n");
@@ -151,6 +160,7 @@ export function guardFusionStream(response, { sourceFormat, validate, signal, ab
           if (emitted) return;
         }
       } catch (error) {
+        if (cancelled) return;
         const failure = signal.aborted
           ? safeFusionError(null, "synthesis", "fusion_aborted")
           : safeFusionError(error);
@@ -163,6 +173,7 @@ export function guardFusionStream(response, { sourceFormat, validate, signal, ab
       }
     },
     cancel(reason) {
+      cancelled = true;
       logFusionFailure(log, safeFusionError(null, "synthesis", "fusion_aborted"), sourceFormat);
       detach(); abort(reason); return reader.cancel(reason);
     },

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
-import { guardFusionStream } from "../../open-sse/services/fusionStream.js";
+import { guardFusionStream, safeFusionError } from "../../open-sse/services/fusionStream.js";
+import { handleComboChat } from "../../open-sse/services/combo.js";
 import { handleFusionChat } from "../../open-sse/services/fusion.js";
 
 const secret = "SECRET_PROMPT_HEADER_ARGS_STACK";
@@ -43,7 +44,7 @@ describe("Fusion safe error categories", () => {
   it.each([
     [frame({ choices: [{ delta: { content: "partial" } }] }), "fusion_stream_incomplete"],
     [`data: {${secret}\n\n`, "fusion_invalid_stream"],
-    [`garbage: ${secret}\n\n`, "fusion_invalid_stream"],
+    [frame({ message: secret, status: "failed" }) + done, "fusion_invalid_stream"],
     [frame({ error: { message: secret, code: secret, details: { token: secret } } }), "fusion_upstream_error"],
     [toolFrame() + finish("length") + done, "fusion_tool_output_truncated"],
   ])("separates stream failures without leaking upstream data", async (text, code) => {
@@ -58,6 +59,55 @@ describe("Fusion safe error categories", () => {
     expect(result.text).toContain('"stage":"synthesis"');
     expect(result.text).toContain('"upstream_status":429');
     expect(result.text.startsWith("event: error")).toBe(sourceFormat === "claude");
+  });
+
+  it("ignores SSE extensions and joins multiline data before parsing", async () => {
+    const text = 'extension: value\n: heartbeat\nid: 1\ndata: {"choices": [\ndata: {"delta":{"content":"normal"}}]}\n\n' + done;
+    const result = await guarded(text);
+    expect(result.text).toBe(text);
+    expect(result.log.warn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["openai", frame({ choices: [{ delta: { reasoning_content: "reasoning", content: "text" } }] }) + frame({ choices: [], usage: { total_tokens: 1 } }) + done],
+    ["claude", frame({ type: "ping" }) + frame({ type: "message_start", message: {} }) + frame({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }) + frame({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "reasoning" } }) + frame({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }) + frame({ type: "message_stop" })],
+    ["openai-responses", frame({ type: "response.created", response: {} }) + frame({ type: "response.reasoning_summary_text.delta", delta: "reasoning" }) + frame({ type: "response.output_text.delta", delta: "text" }) + frame({ type: "response.completed", response: { usage: { total_tokens: 1 } } })],
+  ])("retains normal %s usage and reasoning events", async (sourceFormat, text) => {
+    const result = await guarded(text, { sourceFormat });
+    expect(result.text).toBe(text);
+    expect(result.log.warn).not.toHaveBeenCalled();
+  });
+
+  it.each(["claude", "openai-responses"])("rejects unknown %s payloads before forwarding", async (sourceFormat) => {
+    expectSafe(await guarded(frame({ message: secret, status: "failed" }) + done, { sourceFormat }), "fusion_invalid_stream");
+  });
+
+  it("uses a bounded category for an unknown fallback", () => {
+    expect(safeFusionError(null, secret, secret)).toMatchObject({ code: "fusion_upstream_error", details: { stage: "synthesis" } });
+  });
+
+  it("cancels a pending downstream read without duplicate diagnostics", async () => {
+    const parent = new AbortController();
+    const log = { warn: vi.fn() };
+    const response = guardFusionStream(new Response(new ReadableStream({ start() {} })), {
+      sourceFormat: "openai", signal: parent.signal, validate() {}, abort: (reason) => parent.abort(reason), detach() {}, log,
+    });
+    const reader = response.body.getReader();
+    const pending = reader.read();
+    await Promise.resolve();
+    await reader.cancel(new Error(secret));
+    expect(await pending).toEqual({ done: true, value: undefined });
+    await Promise.resolve();
+    expect(log.warn).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(log.warn.mock.calls)).not.toContain(secret);
+  });
+
+  it.each([true, false])("suppresses raw combo exception logs only for internal Fusion: %s", async (internal) => {
+    const log = { warn: vi.fn(), info() {} };
+    const result = await handleComboChat({ body: {}, models: ["openai/test"], comboStrategy: "fallback", internal, log,
+      handleSingleModel: async () => { throw new Error(secret); } });
+    expect(result.status).toBe(500);
+    expect(JSON.stringify(log.warn.mock.calls).includes(secret)).toBe(!internal);
   });
 
   it("recognizes an SSE error event even without an error wrapper", async () => {
