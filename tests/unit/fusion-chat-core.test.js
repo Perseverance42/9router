@@ -1,12 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import "../translator/registerAll.js";
-const { execute } = vi.hoisted(() => ({ execute: vi.fn() }));
+const { execute, logError, saveRequestDetail } = vi.hoisted(() => ({ execute: vi.fn(), logError: vi.fn(), saveRequestDetail: vi.fn(async () => {}) }));
 vi.mock("../../open-sse/executors/index.js", () => ({ getExecutor: () => ({ noAuth: true, execute }) }));
 vi.mock("../../open-sse/utils/requestLogger.js", () => ({ createRequestLogger: async () => ({
   logClientRawRequest() {}, logRawRequest() {}, logTargetRequest() {},
-  logProviderResponse() {}, logConvertedResponse() {}, logError() {},
+  logProviderResponse() {}, logConvertedResponse() {}, logError,
 }) }));
-vi.mock("@/lib/usageDb.js", () => ({ trackPendingRequest() {}, appendRequestLog: async () => {}, saveRequestDetail: async () => {} }));
+vi.mock("@/lib/usageDb.js", () => ({ trackPendingRequest() {}, appendRequestLog: async () => {}, saveRequestDetail }));
 const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
 const options = (extra = {}) => ({
   body: { messages: [{ role: "user", content: "Question" }], stream: false },
@@ -22,7 +22,27 @@ const upstream = (body, format = "claude") => ({
 });
 
 describe("Fusion internal chat boundary", () => {
-  beforeEach(() => { execute.mockReset(); });
+  beforeEach(() => { execute.mockReset(); logError.mockClear(); saveRequestDetail.mockClear(); });
+  it.each([true, false])("suppresses provider-error diagnostics only for internal calls: %s", async (internal) => {
+    const secret = "SECRET_PROVIDER_MESSAGE_HEADER_STACK";
+    const log = { debug() {}, info() {}, warn: vi.fn(), errorLine: vi.fn() };
+    execute.mockResolvedValue({ ...upstream({}), response: Response.json({ error: { message: secret } }, { status: 502 }) });
+    const result = await handleChatCore(options({ internal, log }));
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(log.errorLine.mock.calls).includes(secret)).toBe(!internal);
+    expect(logError.mock.calls.length > 0).toBe(!internal);
+    expect(saveRequestDetail.mock.calls.length > 0).toBe(!internal);
+  });
+  it("suppresses thrown executor messages and stacks for internal calls", async () => {
+    const secret = "SECRET_EXECUTOR_STACK";
+    const log = { debug() {}, info() {}, warn: vi.fn(), errorLine: vi.fn() };
+    execute.mockRejectedValue(new Error(secret));
+    const result = await handleChatCore(options({ log }));
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(log.errorLine.mock.calls)).not.toContain(secret);
+    expect(await result.response.text()).not.toContain(secret);
+    expect(saveRequestDetail).not.toHaveBeenCalled();
+  });
   it("disables native CLI passthrough and preserves exposed reasoning and literal content", async () => {
     execute.mockResolvedValue(upstream({ type: "message", id: "msg_1", model: "claude", stop_reason: "end_turn", content: [
       { type: "thinking", thinking: "Visible summary" }, { type: "text", text: "```json\n{}\n```" },

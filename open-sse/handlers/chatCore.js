@@ -420,7 +420,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   } catch (error) {
     trackPendingRequest(model, provider, connectionId, false, true);
     appendRequestLog({ model, provider, connectionId, status: `FAILED ${error.name === "AbortError" ? 499 : HTTP_STATUS.BAD_GATEWAY}` }).catch(() => { });
-    saveRequestDetail(buildRequestDetail({
+    if (!internal) saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,
       latency: { ttft: 0, total: Date.now() - requestStartTime },
       tokens: { prompt_tokens: 0, completion_tokens: 0 },
@@ -435,8 +435,8 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       streamController.handleError(error);
       return createErrorResult(499, "Request aborted");
     }
-    const errMsg = formatProviderError(error, provider, model, HTTP_STATUS.BAD_GATEWAY);
-    if (log?.errorLine) {
+    const errMsg = internal ? "Fusion upstream model call failed" : formatProviderError(error, provider, model, HTTP_STATUS.BAD_GATEWAY);
+    if (!internal && log?.errorLine) {
       log.errorLine(reqTag, "✗", `ERROR 502 · ${provider}/${model} · ${Date.now() - requestStartTime}ms\n    ${errMsg}${error.stack ? `\n    ${error.stack}` : ""}`);
     }
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, errMsg);
@@ -470,7 +470,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
               rotationPersisted = true;
             } catch (error) {
               streamController.signal.throwIfAborted();
-              log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${error.message}`);
+              if (!internal) log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${error.message}`);
             }
           }
         }
@@ -484,7 +484,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
         if (onCredentialsRefreshed && !rotationPersisted) {
           try { await onCredentialsRefreshed(newCredentials); } catch (e) {
             streamController.signal.throwIfAborted();
-            log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`);
+            if (!internal) log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`);
           }
         }
         streamController.signal.throwIfAborted();
@@ -516,7 +516,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
         log?.warn?.("TOKEN", `${provider.toUpperCase()} | refresh failed`);
       }
     } catch (e) {
-      log?.warn?.("TOKEN", `${provider.toUpperCase()} | refresh threw: ${e.message}`);
+      if (!internal) log?.warn?.("TOKEN", `${provider.toUpperCase()} | refresh threw: ${e.message}`);
     }
   }
 
@@ -531,7 +531,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     trackPendingRequest(model, provider, connectionId, false, true);
     const { statusCode, message, resetsAtMs } = await parseUpstreamError(providerResponse, executor);
     appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => { });
-    saveRequestDetail(buildRequestDetail({
+    if (!internal) saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,
       latency: { ttft: 0, total: Date.now() - requestStartTime },
       tokens: { prompt_tokens: 0, completion_tokens: 0 },
@@ -543,11 +543,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     })).catch(() => { });
 
     const errMsg = formatProviderError(new Error(message), provider, model, statusCode);
-    if (log?.errorLine) {
+    if (!internal && log?.errorLine) {
       const urlStr = providerUrl ? `\n    URL: ${providerUrl}` : "";
       log.errorLine(reqTag, "✗", `ERROR ${statusCode} · ${provider}/${model} · ${Date.now() - requestStartTime}ms${urlStr}\n    ${errMsg}`);
     }
-    reqLogger.logError(new Error(message), finalBody || translatedBody);
+    if (!internal) reqLogger.logError(new Error(message), finalBody || translatedBody);
     return createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers));
   }
 

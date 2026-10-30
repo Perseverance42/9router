@@ -312,6 +312,7 @@ export async function handleComboChat({
   comboStrategy,
   comboStickyLimit = 1,
   autoSwitch = true,
+  internal = false,
   sessionId = null,
   smartPolicy = "smart",
   sessionSticky = true,
@@ -369,7 +370,7 @@ export async function handleComboChat({
         } catch (err) {
           // Fail open to active sticky model
           rotatedModels = [activeStickyModel, ...models.filter((m) => m !== activeStickyModel)];
-          log.warn("COMBO", `smart-router error, retained model "${activeStickyModel}"`, { error: err?.message || String(err) });
+          if (!internal) log.warn("COMBO", `smart-router error, retained model "${activeStickyModel}"`, { error: err?.message || String(err) });
         }
       } else {
         rotatedModels = [activeStickyModel, ...models.filter((m) => m !== activeStickyModel)];
@@ -395,7 +396,7 @@ export async function handleComboChat({
           log.info("COMBO", `smart-router no decision, fallback to order: [${models.join(", ")}]`);
         }
       } catch (err) {
-        log.warn("COMBO", `smart-router error, fallback to order: [${models.join(", ")}]`, { error: err?.message || String(err) });
+        if (!internal) log.warn("COMBO", `smart-router error, fallback to order: [${models.join(", ")}]`, { error: err?.message || String(err) });
       }
     }
   } else {
@@ -440,7 +441,7 @@ export async function handleComboChat({
           // construction ever does, result.body is already locked by getReader() and can no
           // longer be streamed. Returning `result` would hand the client a locked, unreadable
           // body. Degrade to a clean, valid (empty) SSE stream instead.
-          log.warn("COMBO", `empty-peek error on ${modelStr}, returning empty SSE: ${peekErr?.message || peekErr}`);
+          if (!internal) log.warn("COMBO", `empty-peek error on ${modelStr}, returning empty SSE: ${peekErr?.message || peekErr}`);
           return new Response("data: [DONE]\n\n", {
             status: 200,
             headers: { "Content-Type": "text/event-stream" },
@@ -571,7 +572,7 @@ export async function handleComboChat({
       }
       lastError = error.message || String(error);
       if (!lastStatus) lastStatus = 500;
-      log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastError });
+      if (!internal) log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastError });
     }
   }
 
@@ -595,11 +596,11 @@ export async function handleComboChat({
 
   if (earliestRetryAfter) {
     const retryHuman = formatRetryAfter(earliestRetryAfter);
-    log.warn("COMBO", `All models failed | ${msg} (${retryHuman})`);
+    if (!internal) log.warn("COMBO", `All models failed | ${msg} (${retryHuman})`);
     return unavailableResponse(status, msg, earliestRetryAfter, retryHuman);
   }
 
-  log.warn("COMBO", `All models failed | ${msg}`);
+  if (!internal) log.warn("COMBO", `All models failed | ${msg}`);
   return new Response(
     JSON.stringify({ error: { message: msg } }),
     { status, headers: { "Content-Type": "application/json" } }

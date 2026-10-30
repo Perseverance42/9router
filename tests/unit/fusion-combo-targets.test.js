@@ -67,6 +67,33 @@ beforeEach(() => {
   });
 });
 
+it("does not log stored provider failures for internal Fusion credential exhaustion", async () => {
+  const secret = "SECRET_STORED_PROVIDER_FAILURE";
+  const output = vi.spyOn(console, "log").mockImplementation(() => {});
+  try {
+    add("Main", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
+    mocks.credentials.mockResolvedValue({ allRateLimited: true, lastError: secret, retryAfterHuman: "soon", retryAfter: new Date(Date.now() + 1000).toISOString() });
+    expect((await chat()).status).toBe(502);
+    expect(JSON.stringify(output.mock.calls)).not.toContain(secret);
+  } finally { output.mockRestore(); }
+});
+
+it("propagates internal logging context into a nested fallback combo", async () => {
+  const secret = "SECRET_NESTED_COMBO_EXCEPTION";
+  const output = vi.spyOn(console, "log").mockImplementation(() => {});
+  try {
+    add("Main", ["Panel"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
+    add("Panel", ["openai/panel"]);
+    const normal = mocks.core.getMockImplementation();
+    mocks.core.mockImplementation(async (options) => {
+      if (options.modelInfo.model === "panel") throw new Error(secret);
+      return normal(options);
+    });
+    expect((await chat()).status).toBe(502);
+    expect(JSON.stringify(output.mock.calls)).not.toContain(secret);
+  } finally { output.mockRestore(); }
+});
+
 it.each(["fallback", "round-robin"])("keeps a combo panel as one slot with its %s strategy", async (strategy) => {
   add("Main", ["Panel"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
   add("Panel", ["openai/panel-bad", "openai/panel-good"], { fallbackStrategy: strategy });
