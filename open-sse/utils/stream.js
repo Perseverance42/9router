@@ -172,7 +172,7 @@ export function createSSEStream(options = {}) {
     if (parsed.error || parsed.type === "error" || parsed.type === "response.failed" ||
         parsed.response?.error || ["failed", "incomplete"].includes(parsed.response?.status) ||
         parsed.type === "response.incomplete") upstreamInvalid = true;
-    if (((mode === STREAM_MODE.PASSTHROUGH || targetFormat === FORMATS.OPENAI) && line.slice(5).trim() === "[DONE]") ||
+    if ((targetFormat === FORMATS.OPENAI && line.slice(5).trim() === "[DONE]") ||
         (targetFormat === FORMATS.CLAUDE && parsed.type === "message_stop" && upstreamStarted) ||
         (targetFormat === FORMATS.OPENAI_RESPONSES &&
           ["response.completed", "response.done"].includes(parsed.type) &&
