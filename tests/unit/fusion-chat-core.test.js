@@ -109,6 +109,24 @@ describe("Fusion internal chat boundary", () => {
     expect(json.choices[0].message.content).toBe("```json\n{}\n```");
     expect(json.choices[0].message.reasoning_content).toBe("Visible summary");
   });
+  it.each([4096, 8192, 1000])("enforces a private Fusion ceiling after Claude tool and thinking translation (%i)", async (maxOutputTokens) => {
+    execute.mockResolvedValue(upstream({ type: "message", id: "msg_1", content: [{ type: "text", text: "Safe" }], stop_reason: "end_turn" }));
+    const body = { messages: [{ role: "user", content: "Question" }], max_tokens: maxOutputTokens, thinking: { type: "enabled", budget_tokens: 10000 }, tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }], stream: false };
+    expect((await handleChatCore(options({ body, maxOutputTokens }))).success).toBe(true);
+    const payload = execute.mock.calls[0][0].body;
+    expect(payload.max_tokens).toBeLessThanOrEqual(maxOutputTokens);
+    if (payload.thinking?.type === "enabled") {
+      expect(payload.thinking.budget_tokens).toBeGreaterThanOrEqual(1024);
+      expect(payload.thinking.budget_tokens).toBeLessThan(payload.max_tokens);
+    }
+    if (maxOutputTokens === 1000) expect(payload.thinking.type).toBe("disabled");
+  });
+  it("does not trust a public-body output ceiling or change ordinary Claude tool minimums", async () => {
+    execute.mockResolvedValue(upstream({ type: "message", id: "msg_1", content: [{ type: "text", text: "Safe" }], stop_reason: "end_turn" }));
+    const body = { messages: [{ role: "user", content: "Question" }], max_tokens: 4096, maxOutputTokens: 100, tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }], stream: false };
+    expect((await handleChatCore(options({ body }))).success).toBe(true);
+    expect(execute.mock.calls[0][0].body.max_tokens).toBeGreaterThan(8192);
+  });
   it("rejects missing native Claude envelopes rather than creating empty advice", async () => {
     execute.mockResolvedValue(upstream({}));
     const result = await handleChatCore(options());

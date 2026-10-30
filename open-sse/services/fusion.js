@@ -202,13 +202,14 @@ function capOutput(request, cap) {
 const budgetError = (stage) => new FusionError("Fusion request exceeds the safe context budget", stage, { code: "fusion_context_budget" }, 400);
 
 /** One bounded consultation: initial controller, parallel panel, analyst, native synthesis. */
-export async function handleFusionChat({ body, models, handleSingleModel, log, judgeModel, tuning, signal, sourceFormat = detectFormat(body), outputFormat = sourceFormat, internal = false, preflight, getModelLimits }) {
+export async function handleFusionChat({ body, models, handleSingleModel, log, judgeModel, tuning, signal, sourceFormat = detectFormat(body), outputFormat = sourceFormat, internal = false, preflight, getModelLimits, maxOutputTokens }) {
   const controller = new AbortController();
   const onAbort = () => controller.abort(signal.reason);
   if (signal?.aborted) onAbort();
   else signal?.addEventListener("abort", onAbort, { once: true });
   let stage = "preflight";
   let handedOff = false;
+  let consultRequired = false;
   const checkAbort = () => controller.signal.throwIfAborted();
   const limitCache = new Map();
   const limitsFor = async (model) => {
@@ -230,6 +231,13 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
   };
   const invoke = async (request, model, callStage, outputFormat = FORMATS.OPENAI) => {
     checkAbort();
+    const privateGeneration = ["panel", "analyst"].includes(callStage) || (callStage === "initial" && consultRequired);
+    // Nested Fusion remains one advisory seat; retain its parent's private output ceiling.
+    const ceiling = privateGeneration ? Math.min(explicitOutput(request) ?? Infinity, maxOutputTokens ?? Infinity) : maxOutputTokens;
+    if (positive(ceiling)) {
+      request = structuredClone(request);
+      capOutput(request, ceiling);
+    }
     if (!await fits(request, model)) throw budgetError(callStage);
     checkAbort();
     let response;
@@ -237,6 +245,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
       response = await abortable(() => handleSingleModel(structuredClone(request), model, {
         internal: true, sourceFormat: FORMATS.OPENAI, outputFormat,
         signal: controller.signal, stage: callStage,
+        ...(positive(ceiling) ? { maxOutputTokens: ceiling } : {}),
       }), controller.signal);
     } catch (error) {
       if (controller.signal.aborted) throw error;
@@ -273,6 +282,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
     let consultToolName = FUSION_TOOL_NAME;
     for (let suffix = 1; publicNames.has(consultToolName); suffix++) consultToolName = `${FUSION_TOOL_NAME}_${suffix}`;
     const policy = resolveFusionPolicy(models, tuning, consultToolName);
+    consultRequired = policy.minPanels > 0;
     const judge = judgeModel?.trim() || models[0];
     if (!judge) throw new FusionError("Fusion requires an explicit judge when no panels are configured", stage, {}, 400);
     const publicTools = original.tools || [];
@@ -340,10 +350,12 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
     addInstruction(synthesisBase, FUSION_SYNTHESIS_INSTRUCTIONS);
     const contextBase = { brief: args.brief, participation: { minPanels: policy.minPanels, maxPanels: policy.maxPanels, selectedPanels: selected.length }, responses: [] };
     synthesisBase.messages.push(advisory(contextBase));
-    const analysisCap = Math.min(FUSION_ANALYST_MAX_TOKENS, judgeLimits.maxOutput);
-    const sharedAdvisoryBudget = Math.floor(judgeLimits.contextWindow * FUSION_CONTEXT_ALLOWANCE)
-      - estimateFusionRequest(synthesisBase).tokens - outputReserve(original, judgeLimits) - analysisCap;
-    if (sharedAdvisoryBudget <= 0) throw budgetError(stage);
+    const availableAdvisoryBudget = Math.floor(judgeLimits.contextWindow * FUSION_CONTEXT_ALLOWANCE)
+      - estimateFusionRequest(synthesisBase).tokens - outputReserve(original, judgeLimits);
+    // Split constrained advisory space between evaluation and panel output; 8192 is a ceiling, not a minimum.
+    const analysisCap = Math.min(FUSION_ANALYST_MAX_TOKENS, judgeLimits.maxOutput, Math.floor(availableAdvisoryBudget / 2));
+    const sharedAdvisoryBudget = availableAdvisoryBudget - analysisCap;
+    if (analysisCap < 1 || sharedAdvisoryBudget <= 0) throw budgetError(stage);
     const panelCaps = await Promise.all(selected.map(async ({ model }) => Math.min(
       FUSION_PANEL_MAX_TOKENS, (await limitsFor(model)).maxOutput, explicitOutput(original) ?? Infinity,
       Math.floor(sharedAdvisoryBudget / selected.length),
@@ -391,8 +403,8 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
         if (["json_schema", "json_object"].includes(answerFormat?.type)
           || typeof response.content !== "string" || !response.content.length) return false;
         try {
-          const value = JSON.parse(response.content);
-          if (value && typeof value === "object") return false;
+          JSON.parse(response.content);
+          return false;
         } catch { /* ordinary prose */ }
         return true;
       };

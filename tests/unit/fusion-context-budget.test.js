@@ -33,6 +33,7 @@ describe("Fusion context budget", () => {
     expect(result.ok).toBe(true);
     expect(seen.map(({ stage }) => stage)).toEqual(["initial", "panel", "analyst", "synthesis"]);
     expect(seen[0].request.max_tokens).toBe(4096);
+    expect(seen[0].maxOutputTokens).toBe(4096);
     expect(seen[1].request.max_tokens).toBe(8192);
     expect(JSON.stringify(seen[1].request)).toContain(FUSION_PANEL_INSTRUCTIONS);
     expect(JSON.stringify(seen[1].request)).not.toContain(FUSION_TIGHT_PANEL_INSTRUCTIONS);
@@ -71,6 +72,14 @@ describe("Fusion context budget", () => {
     expect(fn.mock.calls[0][0].max_tokens).toBeUndefined();
   });
 
+  it("does not attach an internal ceiling to a direct named application action", async () => {
+    const fn = vi.fn(async () => completion({ tool_calls: [{ id: "public", type: "function", function: { name: "read_file", arguments: "{}" } }] }, "tool_calls"));
+    const original = { ...body(), max_tokens: 12000, tool_choice: { type: "function", function: { name: "read_file" } } };
+    expect((await run(fn, { body: original, tuning: { minPanels: 0, maxPanels: 0 } })).ok).toBe(true);
+    expect(fn.mock.calls[0][0].max_tokens).toBe(12000);
+    expect(fn.mock.calls[0][2].maxOutputTokens).toBeUndefined();
+  });
+
   it("fails oversized original history before any provider dispatch without leaking prompts", async () => {
     const fn = pipeline();
     const result = await run(fn, { body: { messages: [{ role: "user", content: "SECRET".repeat(150000) }] } });
@@ -80,6 +89,39 @@ describe("Fusion context budget", () => {
     expect(data.error.details).toEqual({ stage: "initial", retryable: false });
     expect(JSON.stringify(data)).not.toContain("SECRET");
     expect(fn).not.toHaveBeenCalled();
+  });
+
+  it("retains a parent advisory ceiling through a nested Fusion synthesis", async () => {
+    const seen = [];
+    expect((await run(pipeline(seen), { internal: true, maxOutputTokens: 2048 })).ok).toBe(true);
+    expect(seen.every(({ maxOutputTokens }) => maxOutputTokens <= 2048)).toBe(true);
+    expect(seen.at(-1).request.max_tokens).toBe(2048);
+  });
+
+  it("does not lower an explicit final-output requirement to fit a tiny judge", async () => {
+    const seen = [];
+    const result = await run(pipeline(seen), { body: { ...body(), max_tokens: 13000 }, getModelLimits: async () => ({ contextWindow: 16384, maxOutput: 16384 }) });
+    expect((await result.json()).error.code).toBe("fusion_context_budget");
+    expect(seen.every(({ request }) => request.max_tokens <= 4096)).toBe(true);
+  });
+
+  it("allocates evaluation and panel space within a 16384-token judge window", async () => {
+    const seen = [];
+    const limits = async () => ({ contextWindow: 16384, maxOutput: 16384 });
+    expect((await run(pipeline(seen), { getModelLimits: limits })).ok).toBe(true);
+    expect(seen.map(({ stage }) => stage)).toEqual(["initial", "panel", "analyst", "synthesis"]);
+    expect(seen[2].request.max_tokens).toBeLessThan(8192);
+    expect(seen[1].maxOutputTokens).toBe(seen[1].request.max_tokens);
+    expect(seen[2].maxOutputTokens).toBe(seen[2].request.max_tokens);
+    expect(seen[3].maxOutputTokens).toBeUndefined();
+    expect(seen[3].request.max_tokens).toBeUndefined();
+  });
+
+  it.each([JSON.stringify("p".repeat(36000)), `${" ".repeat(36000)}null`, `${" ".repeat(36000)}true`, `${" ".repeat(36000)}1`])("never summarizes valid JSON scalar panel content", async (prose) => {
+    const seen = [];
+    const result = await run(pipeline(seen, { prose }), { body: largeBody(), getModelLimits: shortLimits });
+    expect((await result.json()).error.code).toBe("fusion_context_budget");
+    expect(seen.map(({ stage }) => stage)).toEqual(["initial", "panel"]);
   });
 
   it("uses the logical target callback for a short-context combo seat", async () => {

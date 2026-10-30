@@ -61,7 +61,7 @@ export function stripContinuityFields(body) {
   return body;
 }
 
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides, externalSignal, internal = false, responseFormatOverride }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides, externalSignal, internal = false, maxOutputTokens, responseFormatOverride }) {
   if (externalSignal?.aborted) return createErrorResult(499, "Request aborted");
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
@@ -336,6 +336,25 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // system/tools/messages, and a stale anchor costs a full prefix rewrite.
   if (passthrough && clientTool === "claude") anchorClaudeCache(translatedBody);
 
+  // Fusion private generations own a ceiling, not a public request-body flag.
+  // Translators may raise tool/thinking defaults; enforce the ceiling after them.
+  if (internal && Number.isInteger(maxOutputTokens) && maxOutputTokens > 0) {
+    const clamp = (object, key) => {
+      if (object?.[key] !== undefined) object[key] = Math.min(object[key], maxOutputTokens);
+    };
+    for (const key of ["max_tokens", "max_completion_tokens", "max_output_tokens"]) clamp(translatedBody, key);
+    const generation = translatedBody.generationConfig || translatedBody.request?.generationConfig;
+    clamp(generation, "maxOutputTokens");
+    const claudeOutput = translatedBody.max_tokens ?? maxOutputTokens;
+    if (translatedBody.thinking?.type === "enabled" && translatedBody.thinking.budget_tokens >= claudeOutput) {
+      if (claudeOutput > 1024) translatedBody.thinking.budget_tokens = claudeOutput - 1;
+      else translatedBody.thinking = { type: "disabled" };
+    }
+    const geminiOutput = generation?.maxOutputTokens ?? maxOutputTokens;
+    if (generation?.thinkingConfig?.thinkingBudget >= geminiOutput) {
+      generation.thinkingConfig.thinkingBudget = Math.max(0, geminiOutput - 1);
+    }
+  }
   const executor = getExecutor(provider);
   trackPendingRequest(model, provider, connectionId, true);
   appendRequestLog({ model, provider, connectionId, status: "PENDING" }).catch(() => { });

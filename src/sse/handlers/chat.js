@@ -190,6 +190,7 @@ function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAcce
     sourceFormat: execution.sourceFormat || (request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) || undefined : undefined),
     outputFormat: execution.outputFormat,
     internal: execution.internal,
+    maxOutputTokens: execution.maxOutputTokens,
     getModelLimits: async (target) => {
       const visit = async (model, path = []) => {
         signal?.throwIfAborted();
@@ -420,6 +421,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     const result = await handleChatCore({
       externalSignal: execution.signal,
       internal: execution.internal === true,
+      maxOutputTokens: execution.maxOutputTokens,
       responseFormatOverride: execution.outputFormat,
       body: { ...body, model: `${provider}/${model}` },
       modelInfo: { provider, model },

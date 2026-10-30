@@ -110,6 +110,12 @@ it.each(["fallback", "round-robin"])("keeps a combo panel as one slot with its %
   expect(initial).not.toContain("panel_2:");
 });
 
+it("propagates only private generation ceilings into ChatCore", async () => {
+  add("Main", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
+  expect((await chat()).status).toBe(200);
+  expect(mocks.core.mock.calls.map(([options]) => options.maxOutputTokens)).toEqual([4096, 8192, 8192, undefined]);
+});
+
 it("resolves short model limits within a logical combo seat before panel dispatch", async () => {
   add("Main", ["Panel"], { fallbackStrategy: "fusion", judgeModel: "openai/judge" });
   add("Panel", ["openai/gpt-3.5-turbo"]);
