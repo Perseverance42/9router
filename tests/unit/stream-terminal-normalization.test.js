@@ -66,7 +66,7 @@ function accepted(result, tool = false) {
   expect(result.error).toBeUndefined();
   expect(result.abort.signal.aborted).toBe(false);
   expect(result.validate).toHaveBeenCalledTimes(1);
-  expect(result.output).not.toContain('"error"');
+  expect(result.output).not.toMatch(/"error":\s*\{/);
   const calls = result.validate.mock.calls[0][0].choices[0].message.tool_calls;
   expect(calls).toHaveLength(tool ? 1 : 0);
   if (tool) {
@@ -126,6 +126,60 @@ describe("wire completion normalization through registered translators and Fusio
     });
     it(`does not hide malformed native data with DONE (${passthrough ? "passthrough" : "translate"})`, async () => {
       rejected(await run(data(chat({ content: "Hello" })) + "data: {broken\n\n" + done, FORMATS.OPENAI, FORMATS.OPENAI, passthrough));
+    });
+  }
+
+  for (const output of [FORMATS.CLAUDE, FORMATS.OPENAI_RESPONSES]) {
+    for (const tool of [false, true]) {
+      const delta = tool ? { tool_calls: [{ index: 0, id: "call_terminal", type: "function", function: { name: "lookup", arguments: '{"city":"Paris"}' } }] } : { content: "Hello" };
+      const raw = data(chat(delta)) + data(chat({}, tool ? "tool_calls" : "stop"));
+      it(`requires upstream DONE for OpenAI -> ${output} ${tool ? "tool" : "text"}`, async () => {
+        rejected(await run(raw, FORMATS.OPENAI, output));
+        rejected(await run("data: {broken\n\n" + raw + done, FORMATS.OPENAI, output));
+        accepted(await run(raw + done, FORMATS.OPENAI, output), tool);
+      });
+    }
+  }
+  for (const passthrough of [false, true]) {
+    for (const multiline of [false, true]) {
+      it(`accepts ${multiline ? "multiline JSON" : "empty data events"} (${passthrough ? "passthrough" : "translate"})`, async () => {
+        const content = multiline
+          ? JSON.stringify(chat({ content: "Hello" }), null, 2).split("\n").map(line => `data: ${line}\n`).join("") + "\n"
+          : data(chat({ content: "Hello" }));
+        const raw = ": comment\r\nunknown: ignored\r\ndata:\r\n\r\n" + content + "data: \n\n" + data(chat({}, "stop")) + done;
+        const result = await run(raw, FORMATS.OPENAI, FORMATS.OPENAI, passthrough);
+        accepted(result);
+        expect(result.text).toContain("Hello");
+        if (!passthrough) {
+          for (const output of [FORMATS.CLAUDE, FORMATS.OPENAI_RESPONSES]) {
+            const translated = await run(raw, FORMATS.OPENAI, output);
+            accepted(translated);
+            expect(translated.text).toContain("Hello");
+          }
+        }
+      });
+    }
+  }
+  for (const [format, events] of [[FORMATS.CLAUDE, claude()], [FORMATS.OPENAI_RESPONSES, responses()]]) {
+    it(`does not release malformed native ${format} completion`, async () => {
+      rejected(await run("data: {broken\n\n" + events.map(frame).join("") + done, format, format));
+    });
+  }
+  it("gates pivoted Claude -> Responses terminals", async () => {
+    rejected(await run(claude().slice(0, -1).map(frame).join(""), FORMATS.CLAUDE, FORMATS.OPENAI_RESPONSES));
+    accepted(await run(claude().map(frame).join(""), FORMATS.CLAUDE, FORMATS.OPENAI_RESPONSES));
+  });
+  it("does not translate length into successful Responses completion", async () => {
+    rejected(await run(data(chat({ content: "Hello" })) + data(chat({}, "length")) + done, FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES));
+  });
+
+  for (const output of [FORMATS.OPENAI, FORMATS.CLAUDE, FORMATS.OPENAI_RESPONSES]) {
+    it(`requires Ollama done:true for ${output}`, async () => {
+      const partial = JSON.stringify({ model: "test", message: { role: "assistant", content: "Hello" }, done: false }) + "\n\n";
+      const terminal = JSON.stringify({ model: "test", message: { role: "assistant", content: "" }, done: true, done_reason: "stop", prompt_eval_count: 2, eval_count: 3 });
+      rejected(await run(partial, FORMATS.OLLAMA, output));
+      accepted(await run(partial + terminal, FORMATS.OLLAMA, output));
+      rejected(await run(partial + "{broken\n" + terminal, FORMATS.OLLAMA, output));
     });
   }
 
