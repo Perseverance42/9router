@@ -98,6 +98,36 @@ export function createSSEStream(options = {}) {
   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
   let finalized = false;
   let completionFlushTimer = null;
+  let upstreamCompleted = false;
+  let upstreamInvalid = false;
+
+  // Only wire-level completion counts. Translators can synthesize finish_reason
+  // on flush, even when the upstream disconnected mid-response.
+  const observeCompletion = (line, parsed) => {
+    if (!line.startsWith("data:")) return;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      upstreamInvalid = true;
+      return;
+    }
+    if (parsed.error || parsed.type === "error" || parsed.type === "response.failed" ||
+        parsed.response?.error || ["failed", "incomplete"].includes(parsed.response?.status) ||
+        parsed.type === "response.incomplete") upstreamInvalid = true;
+    if (((mode === STREAM_MODE.PASSTHROUGH || targetFormat === FORMATS.OPENAI) && line.slice(5).trim() === "[DONE]") ||
+        (targetFormat === FORMATS.CLAUDE && parsed.type === "message_stop" && state?.messageId) ||
+        (targetFormat === FORMATS.OPENAI_RESPONSES &&
+          ["response.completed", "response.done"].includes(parsed.type) &&
+          parsed.response?.status === "completed")) upstreamCompleted = true;
+  };
+
+  const emitCompletedOpenAIStream = (controller) => {
+    if ((mode !== STREAM_MODE.PASSTHROUGH && sourceFormat !== FORMATS.OPENAI) ||
+        !upstreamCompleted || upstreamInvalid || streamDoneSent) return;
+    finalizeStream();
+    const output = "data: [DONE]\n\n";
+    reqLogger?.appendConvertedChunk?.(output);
+    controller.enqueue(sharedEncoder.encode(output));
+    streamDoneSent = true;
+  };
 
   // Lane quirk: upstream streams thinking under the OpenRouter aliases
   // (`reasoning` / `reasoning_details[]`) instead of reasoning_content — OpenCode
@@ -175,6 +205,11 @@ export function createSSEStream(options = {}) {
 
         // Passthrough mode: normalize and forward
         if (mode === STREAM_MODE.PASSTHROUGH) {
+          if (trimmed.startsWith("data:")) observeCompletion(trimmed, parseSSELine(trimmed));
+          if (trimmed.startsWith("data:") && trimmed.slice(5).trim() === "[DONE]") {
+            emitCompletedOpenAIStream(controller);
+            continue;
+          }
           let output;
           let injectedUsage = false;
           let responsesTerminal = false;
@@ -318,6 +353,7 @@ export function createSSEStream(options = {}) {
         if (!trimmed) continue;
 
         const parsed = parseSSELine(trimmed, targetFormat);
+        observeCompletion(trimmed, parsed);
         if (!parsed) continue;
 
         // Responses API same-format passthrough: preserve event framing + track terminal state
@@ -351,12 +387,13 @@ export function createSSEStream(options = {}) {
             sseEmittedCount++;
           }
 
+          emitCompletedOpenAIStream(controller);
           if (keepsOpenAIResponsesFormat && !streamDoneSent) {
             const doneOutput = "data: [DONE]\n\n";
             reqLogger?.appendConvertedChunk?.(doneOutput);
             controller.enqueue(sharedEncoder.encode(doneOutput));
+            streamDoneSent = true;
           }
-          streamDoneSent = true;
           if (keepsOpenAIResponsesFormat) openAIResponsesDoneSent = true;
           continue;
         }
@@ -478,27 +515,20 @@ export function createSSEStream(options = {}) {
 
         if (mode === STREAM_MODE.PASSTHROUGH) {
           if (buffer) {
+            const line = buffer.trim();
+            observeCompletion(line, parseSSELine(line));
             let output = buffer;
             if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
               output = "data: " + buffer.slice(5);
             }
-            reqLogger?.appendConvertedChunk?.(output);
-            controller.enqueue(sharedEncoder.encode(output));
-          }
-
-          // IMPORTANT: In passthrough mode we still must terminate the SSE stream.
-          // Some clients (e.g. OpenClaw) expect the OpenAI-style sentinel:
-          //   data: [DONE]\n\n
-          // Without it they can hang until timeout and trigger failover.
-          // Gemini-family clients (Antigravity, Vertex, Gemini) reject this sentinel with 400 syntax errors.
-          const isGeminiFamily = provider === "antigravity" || provider === "gemini" || provider === "vertex";
-          if (!streamDoneSent && !isGeminiFamily) {
-            const doneOutput = "data: [DONE]\n\n";
-            reqLogger?.appendConvertedChunk?.(doneOutput);
-            controller.enqueue(sharedEncoder.encode(doneOutput));
+            if (line.slice(5).trim() !== "[DONE]") {
+              reqLogger?.appendConvertedChunk?.(output);
+              controller.enqueue(sharedEncoder.encode(output));
+            }
           }
 
           finalizeStream();
+          emitCompletedOpenAIStream(controller);
           return;
         }
 
@@ -507,6 +537,7 @@ export function createSSEStream(options = {}) {
           // accepts "data: " lines, so an NDJSON provider (Ollama) lost whatever
           // arrived without its closing newline.
           const parsed = parseSSELine(buffer.trim(), targetFormat);
+          observeCompletion(buffer.trim(), parsed);
           // parseSSELine turns the SSE sentinel "data: [DONE]" into { done: true },
           // which must not be translated. An Ollama chunk also carries done:true,
           // but it is the real final chunk — it holds finish_reason and the token
@@ -574,9 +605,11 @@ export function createSSEStream(options = {}) {
         }
 
         finalizeStream();
+        emitCompletedOpenAIStream(controller);
       } catch (error) {
         console.log("Error in flush:", error);
         finalizeStream();
+        throw error;
       }
     }
   });
