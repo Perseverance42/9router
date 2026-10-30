@@ -104,11 +104,28 @@ describe("/v1/models Fusion judge reasoning", () => {
   it.each([
     ["NamedJudge", { NamedJudge: "cx/gpt-5.6(high)" }],
     ["cx/gpt-5.6(high)", {}],
-    ["NamedJudge(high)", { NamedJudge: { provider: "codex", model: "gpt-5.6" } }],
+    ["NamedJudge(high)", { "NamedJudge(high)": { provider: "codex", model: "gpt-5.6" } }],
   ])("resolves runtime aliases and strips leaf thinking suffixes: %s", async (target, aliases) => {
     db.getModelAliases.mockResolvedValue(aliases);
     const [model] = await advertise([{ name: "Fusion", models: [panel] }], { Fusion: fusion(target) });
     expect(model.capabilities).toMatchObject(expected("codex", "gpt-5.6"));
+  });
+
+  it("uses the exact suffixed alias rather than its unsuffixed collision", async () => {
+    db.getModelAliases.mockResolvedValue({
+      Review: "openai/gpt-4o",
+      "Review(high)": "zai/glm-5.2",
+    });
+    const [model] = await advertise([{ name: "Fusion", models: [panel] }], { Fusion: fusion("Review(high)") });
+    expect(model.capabilities).toMatchObject(expected("zai", "glm-5.2"));
+    expect(model.capabilities.reasoning).not.toBe(getCapabilitiesForModel("openai", "gpt-4o").reasoning);
+  });
+
+  it("does not reinterpret a suffixed alias as its unsuffixed alias", async () => {
+    db.getModelAliases.mockResolvedValue({ NamedJudge: { provider: "codex", model: "gpt-5.6" } });
+    const [model] = await advertise([{ name: "Fusion", models: [judge] }], { Fusion: fusion("NamedJudge(high)") });
+    expect(model.capabilities).toMatchObject(expected("openai", "NamedJudge"));
+    expect(model.capabilities.thinkingLevels).toBeNull();
   });
 
   it("does not reinterpret a suffixed combo name as a judge combo", async () => {

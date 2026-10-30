@@ -415,8 +415,8 @@ export async function buildModelsList(kindFilter, options = {}) {
       if (!child) return null;
       result = { ...child, depth: child.depth + 1 };
     } else {
-      // Only capability lookup strips suffixes; combo routing is unchanged.
-      const info = await getModelInfo(stripThinkingSuffix(target));
+      // Resolve exact aliases before stripping the resolved leaf's thinking suffix.
+      const info = await getModelInfo(target);
       if (!info.provider) return null;
       const model = stripThinkingSuffix(info.model);
       result = { caps: getCapabilitiesForModel(info.provider, model), levels: getThinkingLevels(info.provider, model), depth: 0 };
