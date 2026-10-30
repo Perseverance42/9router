@@ -5,17 +5,19 @@ import { extractReasoningText } from "../translator/concerns/reasoning.js";
 import { translateRequest } from "../translator/index.js";
 import { detectFormat } from "./provider.js";
 import { deliverFusionCompletion } from "./fusionOutput.js";
-import { guardFusionStream } from "./fusionStream.js";
+import { guardFusionStream, safeFusionError, logFusionFailure } from "./fusionStream.js";
 import {
   FUSION_TOOL_NAME, FUSION_ANALYST_SCHEMA, FUSION_ANALYST_MAX_TOKENS,
   FUSION_ANALYST_INSTRUCTIONS, FUSION_SYNTHESIS_INSTRUCTIONS, FUSION_CONSULT_PARAMETERS,
-  FUSION_ERROR_MESSAGE_LIMIT, FUSION_TOOL_STATUS_INSTRUCTIONS, resolveFusionPolicy, validateFusionSelection, validateFusionAnalysis,
+  FUSION_TOOL_STATUS_INSTRUCTIONS, resolveFusionPolicy, validateFusionSelection, validateFusionAnalysis,
 } from "../config/fusion.js";
 
 class FusionError extends Error {
   constructor(message, stage, details = {}, status = 502) {
     super(message);
     this.stage = stage;
+    this.type = "fusion_error";
+    this.code = details.code || `fusion_${stage}_error`;
     this.details = details;
     this.status = status;
   }
@@ -172,16 +174,22 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
   const checkAbort = () => controller.signal.throwIfAborted();
   const invoke = async (request, model, callStage, outputFormat = FORMATS.OPENAI) => {
     checkAbort();
-    const response = await abortable(() => handleSingleModel(structuredClone(request), model, {
-      internal: true, sourceFormat: FORMATS.OPENAI, outputFormat,
-      signal: controller.signal, stage: callStage,
-    }), controller.signal);
+    let response;
+    try {
+      response = await abortable(() => handleSingleModel(structuredClone(request), model, {
+        internal: true, sourceFormat: FORMATS.OPENAI, outputFormat,
+        signal: controller.signal, stage: callStage,
+      }), controller.signal);
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
+      throw new FusionError("Upstream model call failed", callStage, { code: "fusion_upstream_error" });
+    }
     checkAbort();
     if (!response?.ok) {
       let upstream;
       try { upstream = await abortable(() => response.json(), controller.signal); } catch { /* no safe structured error */ }
-      const message = typeof upstream?.error?.message === "string" ? upstream.error.message : "Upstream model call failed";
-      throw new FusionError(message.slice(0, FUSION_ERROR_MESSAGE_LIMIT), callStage, { model, upstream_status: response?.status });
+      const failure = safeFusionError(upstream?.error, callStage, "fusion_upstream_error", response?.status);
+      throw new FusionError(failure.message, callStage, { ...failure.details, code: failure.code });
     }
     return response;
   };
@@ -194,7 +202,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
       return json;
     } catch (error) {
       if (error instanceof FusionError || controller.signal.aborted) throw error;
-      throw new FusionError(`Invalid ${callStage} completion: ${error.message}`, callStage, { model });
+      throw new FusionError("Invalid model completion", callStage, { code: "fusion_invalid_completion" });
     }
   };
   try {
@@ -221,11 +229,11 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
       const message = completion.choices[0].message;
       if (!message.tool_calls?.length && ["json_schema", "json_object"].includes(answerFormat?.type)) {
         let value;
-        try { value = JSON.parse(message.content); } catch { throw new FusionError("Judge answer violates requested JSON output", stage); }
+        try { value = JSON.parse(message.content); } catch { throw new FusionError("Judge answer violates requested JSON output", stage, { code: "fusion_output_constraints" }); }
         if (answerFormat.type === "json_object" && (!value || typeof value !== "object" || Array.isArray(value))) {
-          throw new FusionError("Judge answer must be a JSON object", stage);
+          throw new FusionError("Judge answer must be a JSON object", stage, { code: "fusion_output_constraints" });
         }
-        if (answerValidator && !answerValidator(value)) throw new FusionError("Judge answer violates requested output schema", stage);
+        if (answerValidator && !answerValidator(value)) throw new FusionError("Judge answer violates requested output schema", stage, { code: "fusion_output_constraints" });
       }
     };
     const rejected = await abortable(() => preflight?.([...new Set([...models, judge])], original), controller.signal);
@@ -313,6 +321,9 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
     const requiresAction = original.tool_choice === "required" || typeof original.tool_choice === "object";
     if (!synthesis.stream || (!analysis.usable_response_ids.length && (requiresAction || answerFormat))) {
       const completion = await complete(synthesis, judge, stage);
+      if (completion.choices[0].message.tool_calls?.length && ["length", "max_tokens", "content_filter"].includes(completion.choices[0].finish_reason)) {
+        throw new FusionError("Truncated tool output", stage, { code: "fusion_tool_output_truncated" });
+      }
       try {
         validatePublicAction(completion, original, validators, stage);
         validateAnswer(completion);
@@ -329,7 +340,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
     // ponytail: streamed text/schema correctness is provider-enforced; buffer the
     // final completion when full precommit answer validation becomes necessary.
     return guardFusionStream(response, {
-      sourceFormat: outputFormat, signal: controller.signal,
+      sourceFormat: outputFormat, signal: controller.signal, log,
       validate: (completion) => validatePublicAction(completion, original, validators, stage),
       abort: (reason) => controller.abort(reason),
       detach: () => signal?.removeEventListener("abort", onAbort),
@@ -337,13 +348,12 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, j
   } catch (error) {
     const clientAborted = signal?.aborted;
     if (!controller.signal.aborted) controller.abort(error);
-    const failure = error instanceof FusionError ? error : new FusionError(error.message || "Fusion execution failed", stage, {}, stage === "preflight" ? 400 : 502);
-    log?.warn?.("FUSION", `${failure.stage}: ${failure.message}`);
-    return new Response(JSON.stringify({ error: {
-      message: clientAborted ? "Request aborted" : failure.message,
-      type: "fusion_error", code: clientAborted ? "fusion_aborted" : failure.details.code || `fusion_${failure.stage}_error`,
-      details: { stage: failure.stage, ...failure.details },
-    } }), { status: clientAborted ? 499 : failure.status, headers: { "Content-Type": "application/json" } });
+    const failure = safeFusionError(clientAborted ? null : error, stage, clientAborted ? "fusion_aborted" : `fusion_${stage}_error`);
+    logFusionFailure(log, failure, outputFormat);
+    return new Response(JSON.stringify({ error: failure }), {
+      status: clientAborted ? 499 : error instanceof FusionError ? error.status : stage === "preflight" ? 400 : 502,
+      headers: { "Content-Type": "application/json" },
+    });
   } finally {
     // Active native synthesis keeps the parent signal until its stream terminates.
     if (!handedOff) signal?.removeEventListener("abort", onAbort);
@@ -357,7 +367,7 @@ function validatePublicAction(completion, request, validators, stage = "initial"
   if ((request.tool_choice === "none" && calls.length) || (required && !calls.length)
     || (named && calls.some((call) => call.function?.name !== named))
     || (request.parallel_tool_calls === false && calls.length > 1)) {
-    throw new FusionError("Judge action violates client tool constraints", stage);
+    throw new FusionError("Judge action violates client tool constraints", stage, { code: "fusion_tool_constraints" });
   }
-  if (candidate(completion, request.tools, request, validators).issues.length) throw new FusionError("Judge returned invalid application calls", stage);
+  if (candidate(completion, request.tools, request, validators).issues.length) throw new FusionError("Judge returned invalid application calls", stage, { code: "fusion_invalid_tool_calls" });
 }
