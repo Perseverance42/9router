@@ -476,7 +476,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
         }
         streamController.signal.throwIfAborted();
         return result;
-      }, 3, log, streamController.signal);
+      }, 3, internal ? null : log, streamController.signal);
       if (newCredentials?.accessToken || newCredentials?.copilotToken) {
         if (log?.line) log.line(reqTag, "🔑", `TOKEN REFRESHED · ${provider}/${model}`);
         Object.assign(credentials, newCredentials);

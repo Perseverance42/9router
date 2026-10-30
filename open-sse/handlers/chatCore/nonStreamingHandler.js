@@ -256,7 +256,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
       responseBody = await providerResponse.json();
     } catch (err) {
       appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
-      console.error(`[ChatCore] Failed to parse JSON from ${provider}:`, err.message);
+      if (!internal) console.error(`[ChatCore] Failed to parse JSON from ${provider}:`, err.message);
       return createErrorResult(HTTP_STATUS.BAD_GATEWAY, `Invalid JSON response from ${provider}`);
     }
   }
@@ -276,7 +276,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     Promise.resolve()
       .then(onRequestSuccess)
       .catch(err => {
-        console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
+        if (!internal) console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
       });
   }
 
@@ -353,7 +353,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     pxpipe,
     status: "success"
   }, { endpoint: clientRawRequest?.endpoint || null })).catch(err => {
-    console.error("[RequestDetail] Failed to save:", err.message);
+    if (!internal) console.error("[RequestDetail] Failed to save:", err.message);
   });
 
   return {

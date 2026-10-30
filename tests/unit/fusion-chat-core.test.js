@@ -1,7 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import "../translator/registerAll.js";
-const { execute, logError, saveRequestDetail } = vi.hoisted(() => ({ execute: vi.fn(), logError: vi.fn(), saveRequestDetail: vi.fn(async () => {}) }));
-vi.mock("../../open-sse/executors/index.js", () => ({ getExecutor: () => ({ noAuth: true, execute }) }));
+const { execute, logError, saveRequestDetail, executor } = vi.hoisted(() => {
+  const execute = vi.fn();
+  return { execute, logError: vi.fn(), saveRequestDetail: vi.fn(async () => {}), executor: { noAuth: true, execute, refreshCredentials: vi.fn() } };
+});
+vi.mock("../../open-sse/executors/index.js", () => ({ getExecutor: () => executor }));
 vi.mock("../../open-sse/utils/requestLogger.js", () => ({ createRequestLogger: async () => ({
   logClientRawRequest() {}, logRawRequest() {}, logTargetRequest() {},
   logProviderResponse() {}, logConvertedResponse() {}, logError,
@@ -22,7 +25,59 @@ const upstream = (body, format = "claude") => ({
 });
 
 describe("Fusion internal chat boundary", () => {
-  beforeEach(() => { execute.mockReset(); logError.mockClear(); saveRequestDetail.mockClear(); });
+  beforeEach(() => { execute.mockReset(); logError.mockClear(); saveRequestDetail.mockClear(); executor.noAuth = true; executor.refreshCredentials.mockReset(); });
+  it.each([true, false])("keeps invalid JSON diagnostics private only for internal calls: %s", async (internal) => {
+    const secret = "S3CR3T";
+    const output = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      execute.mockResolvedValue({ ...upstream({}), response: new Response(secret, { headers: { "content-type": "application/json" } }) });
+      const result = await handleChatCore(options({ internal }));
+      expect(result.response.status).toBe(502);
+      expect(await result.response.text()).not.toContain(secret);
+      expect(JSON.stringify(output.mock.calls).includes(secret)).toBe(!internal);
+    } finally { output.mockRestore(); }
+  });
+  it.each([true, false])("keeps blocked HTML diagnostics private only for internal calls: %s", async (internal) => {
+    const secret = "SECRET_HTML_TITLE_BODY";
+    const log = { debug() {}, info() {}, warn: vi.fn(), errorLine: vi.fn() };
+    execute.mockResolvedValue({ ...upstream({}), response: new Response(`<title>${secret}</title>`, { headers: { "content-type": "text/html" } }) });
+    const result = await handleChatCore(options({ internal, log, body: { messages: [{ role: "user", content: "Question" }], stream: true } }));
+    expect(result.success).toBe(false);
+    expect(result.response.status).toBe(internal ? 502 : 200);
+    expect((await result.response.text()).includes(secret)).toBe(!internal);
+    expect(JSON.stringify(log.errorLine.mock.calls).includes(secret)).toBe(!internal);
+  });
+  it("suppresses adjacent callback and persistence exception logs for internal completions", async () => {
+    const secret = "SECRET_SUCCESS_CALLBACK_STORAGE_ERROR";
+    const output = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      saveRequestDetail.mockRejectedValueOnce(new Error(secret));
+      execute.mockResolvedValue(upstream({ type: "message", id: "msg_1", content: [{ type: "text", text: "Safe answer" }], stop_reason: "end_turn" }));
+      const result = await handleChatCore(options({ onRequestSuccess: async () => { throw new Error(secret); } }));
+      expect(result.success).toBe(true);
+      expect(await result.response.text()).not.toContain(secret);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(JSON.stringify(output.mock.calls)).not.toContain(secret);
+    } finally { output.mockRestore(); }
+  });
+  it.each([true, false])("keeps refresh retry exceptions private only for internal calls: %s", async (internal) => {
+    const secret = "SECRET_REFRESH_THROW_MESSAGE";
+    const log = { debug: vi.fn(), info() {}, warn: vi.fn(), error: vi.fn(), errorLine: vi.fn() };
+    executor.noAuth = false;
+    executor.refreshCredentials.mockRejectedValue(new Error(secret));
+    execute.mockImplementation(async () => ({ ...upstream({}), response: Response.json({ error: { message: "Unauthorized" } }, { status: 401 }) }));
+    vi.useFakeTimers();
+    try {
+      const pending = handleChatCore(options({ internal, log }));
+      await vi.runAllTimersAsync();
+      const result = await pending;
+      expect(result.response.status).toBe(401);
+      expect(executor.refreshCredentials).toHaveBeenCalledTimes(3);
+      expect(await result.response.text()).not.toContain(secret);
+      expect(JSON.stringify(log.warn.mock.calls).includes(secret)).toBe(!internal);
+    } finally { vi.useRealTimers(); }
+  });
   it.each([true, false])("suppresses provider-error diagnostics only for internal calls: %s", async (internal) => {
     const secret = "SECRET_PROVIDER_MESSAGE_HEADER_STACK";
     const log = { debug() {}, info() {}, warn: vi.fn(), errorLine: vi.fn() };
@@ -66,6 +121,19 @@ describe("Fusion internal chat boundary", () => {
     }), responseFormat: "openai", transformedBody: {} });
     const result = await handleChatCore(options());
     expect(result.response.status).toBe(502);
+  });
+  it("suppresses adjacent forced-stream reader exception logs", async () => {
+    const secret = "SECRET_FORCED_SSE_READER_ERROR";
+    const output = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      execute.mockResolvedValue({ response: new Response(new ReadableStream({ start(controller) { controller.error(new Error(secret)); } }), {
+        headers: { "content-type": "text/event-stream" },
+      }), responseFormat: "openai-responses", transformedBody: {} });
+      const result = await handleChatCore(options());
+      expect(result.response.status).toBe(502);
+      expect(await result.response.text()).not.toContain(secret);
+      expect(JSON.stringify(output.mock.calls)).not.toContain(secret);
+    } finally { output.mockRestore(); }
   });
   it("rejects an unterminated Responses stream instead of fabricating empty advice", async () => {
     execute.mockResolvedValue({ response: new Response('event: response.created\ndata: {"response":{"id":"resp_1"}}\n\n', {
