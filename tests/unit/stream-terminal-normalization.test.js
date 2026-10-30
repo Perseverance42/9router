@@ -11,6 +11,8 @@ vi.mock("@/lib/usageDb.js", () => ({
 import { FORMATS } from "../../open-sse/translator/formats.js";
 import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger } from "../../open-sse/utils/stream.js";
 import { guardFusionStream } from "../../open-sse/services/fusionStream.js";
+import { handleStreamingResponse } from "../../open-sse/handlers/chatCore/streamingHandler.js";
+import { createStreamController } from "../../open-sse/utils/streamHandler.js";
 
 const data = (value) => `data: ${JSON.stringify(value)}\n\n`;
 const frame = (value) => `event: ${value.type}\n${data(value)}`;
@@ -46,9 +48,21 @@ async function run(raw, upstream = FORMATS.OPENAI, output = FORMATS.OPENAI, pass
     for (let i = 0; i < bytes.length; i += 47) controller.enqueue(bytes.slice(i, i + 47));
     controller.close();
   } });
-  const transform = passthrough ? createPassthroughStreamWithLogger("openai", null, "test", null, null, callback)
-    : createSSETransformStreamWithLogger(upstream, output, "test", null, null, "test", null, null, callback);
-  const [capture, guarded] = input.pipeThrough(transform).tee();
+  let normalizedBody;
+  if (passthrough === "production") {
+    const result = await handleStreamingResponse({
+      providerResponse: new Response(input, { headers: { "content-type": "text/event-stream" } }),
+      provider: "test", model: "test", sourceFormat: output, targetFormat: upstream,
+      body: {}, requestStartTime: Date.now(), onStreamComplete: callback,
+      streamController: createStreamController(),
+    });
+    normalizedBody = result.response.body;
+  } else {
+    const transform = passthrough ? createPassthroughStreamWithLogger("openai", null, "test", null, null, callback, null, null, upstream)
+      : createSSETransformStreamWithLogger(upstream, output, "test", null, null, "test", null, null, callback);
+    normalizedBody = input.pipeThrough(transform);
+  }
+  const [capture, guarded] = normalizedBody.tee();
   // Capture transform errors separately: the guard must also reject, never validate.
   const normalized = new Response(capture).text().then(text => ({ text }), error => ({ error }));
   const abort = new AbortController();
@@ -183,6 +197,40 @@ describe("wire completion normalization through registered translators and Fusio
     });
   }
 
+  for (const [format, fixture] of [[FORMATS.CLAUDE, claude], [FORMATS.OPENAI_RESPONSES, responses]]) {
+    for (const tool of [false, true]) {
+      it(`production passthrough preserves complete ${format} ${tool ? "tool" : "text"} frames`, async () => {
+        const raw = fixture(tool).map(frame).join("");
+        const result = await run(raw, format, format, "production");
+        accepted(result, tool);
+        const terminal = frame(fixture(tool).at(-1));
+        expect(result.text).toBe(raw + (format === FORMATS.OPENAI_RESPONSES ? done : ""));
+        expect(result.text).toContain(terminal);
+        expect(result.output).toContain(terminal);
+        rejected(await run(fixture(tool).slice(0, -1).map(frame).join(""), format, format, "production"));
+      });
+    }
+  }
+  for (const production of [false, "production"]) {
+    for (const suffix of ["", done]) {
+      it(`orders native Responses completion and usage before DONE (${production || "translate"}, suffix ${!!suffix})`, async () => {
+        const result = await run(responses().map(frame).join("") + suffix, FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, production);
+        accepted(result);
+        expect(result.text.indexOf("response.completed")).toBeLessThan(result.text.indexOf(done));
+        expect(result.text.match(/data: \[DONE\]/g)).toHaveLength(1);
+        const completed = result.output.split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6))).find(event => event.type === "response.completed");
+        expect(completed.response.usage).toEqual({ input_tokens: 2, output_tokens: 3 });
+      });
+      it(`does not release native Responses completion after callback failure (${production || "translate"}, suffix ${!!suffix})`, async () => {
+        const result = await run(responses().map(frame).join("") + suffix, FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, production, () => { throw new Error("callback failed"); });
+        expect(result.abort.signal.aborted).toBe(true);
+        expect(result.validate).not.toHaveBeenCalled();
+        expect(result.output).toContain('"error"');
+        expect(result.output).not.toContain("response.completed");
+      });
+    }
+  }
+
   it("handles a terminal data line without a final newline", async () => {
     const result = await run(claude().map(frame).join("").trimEnd(), FORMATS.CLAUDE);
     accepted(result);
@@ -215,6 +263,11 @@ describe("wire completion normalization through registered translators and Fusio
     // Fusion permits incomplete text; it must still reject truncated tool output.
     expect(result.abort.signal.aborted).toBe(false);
     expect(result.validate).toHaveBeenCalledTimes(1);
+    const production = await run(frame(responses()[0]) + frame(incomplete), FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES, "production");
+    expect(production.text).toContain(frame(incomplete));
+    expect(production.text).not.toContain(done);
+    expect(production.text).not.toContain("response.completed");
+    expect(production.text).not.toContain("response.failed");
     const tool = await run([...responses(true).slice(0, -1), incomplete].map(frame).join(""), FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES);
     expect(tool.text).toContain(data(incomplete));
     expect(tool.text).not.toContain(done);
