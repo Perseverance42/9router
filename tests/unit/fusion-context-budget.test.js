@@ -167,7 +167,20 @@ describe("Fusion context budget", () => {
     expect(seen[2].signal.aborted).toBe(true);
   });
 
-  it("uses UTF-8 bytes and excludes media base64 while marking media estimation unsupported", () => {
+  it("preserves excluded media for provider dispatch, where media costs can overflow upstream", async () => {
+    const media = { type: "image_url", image_url: { url: `data:image/png;base64,${"a".repeat(50000)}` } };
+    const original = { messages: [{ role: "user", content: [{ type: "text", text: "Describe" }, media] }] };
+    const fn = vi.fn(async (request) => {
+      expect(request.messages.at(-1).content).toEqual(original.messages[0].content);
+      return new Response(JSON.stringify({ error: { message: "Provider media context overflow" } }), { status: 400 });
+    });
+    const result = await run(fn, { body: original });
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect((await result.json()).error.code).toBe("fusion_upstream_error");
+    expect(estimateFusionRequest(original).mediaEstimationUnsupported).toBe(true);
+  });
+
+  it("uses UTF-8 bytes and excludes media base64 while marking only media estimation unsupported", () => {
     expect(estimateFusionRequest({ messages: [{ content: "é".repeat(30) }] }).tokens).toBeGreaterThan(estimateFusionRequest({ messages: [{ content: "a".repeat(30) }] }).tokens);
     const media = (data) => ({ messages: [{ content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${data}` } }] }] });
     expect(estimateFusionRequest(media("a".repeat(50000)))).toEqual(estimateFusionRequest(media("b")));

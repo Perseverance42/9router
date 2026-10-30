@@ -184,6 +184,7 @@ export async function handleChat(request, clientRawRequest = null) {
 
 function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAccess, comboModels, execution = {}) {
   const signal = execution.signal || request?.signal;
+  const modelLimits = new Map();
   return {
     signal,
     sourceFormat: execution.sourceFormat || (request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) || undefined : undefined),
@@ -191,21 +192,37 @@ function fusionExecutionContext(body, clientRawRequest, request, apiKey, keyAcce
     internal: execution.internal,
     getModelLimits: async (target) => {
       const visit = async (model, path = []) => {
-        if (path.includes(model) || path.length >= 32) throw new Error("Invalid Fusion model limits");
+        signal?.throwIfAborted();
+        if (path.includes(model)) throw new Error("Invalid Fusion model limits");
+        if (modelLimits.has(model)) {
+          const cached = modelLimits.get(model);
+          if (path.length + cached.depth > 32) throw new Error("Invalid Fusion model limits");
+          return cached;
+        }
         const info = await getModelInfo(model);
-        if (info.provider) return getCapabilitiesForModel(info.provider, info.model);
+        if (info.provider) {
+          const limits = { ...getCapabilitiesForModel(info.provider, info.model), depth: 0 };
+          modelLimits.set(model, limits);
+          return limits;
+        }
+        if (path.length >= 32) throw new Error("Invalid Fusion model limits");
         const children = await getComboModels(model, { allowEmpty: true });
         const settings = await getSettings();
         const config = settings.comboStrategies?.[model] || {};
         const judge = (config.fallbackStrategy || settings.comboStrategy) === "fusion" ? config.judgeModel?.trim() || children?.[0] : null;
         const members = [...new Set([...(children || []), ...(judge ? [judge] : [])])];
         if (!members.length) throw new Error("Invalid Fusion model limits");
-        const limits = await Promise.all(members.map((child) => visit(child, [...path, model])));
+        // Finish each subtree before visiting siblings so reconvergent DAGs reuse it.
+        const limits = [];
+        for (const child of members) limits.push(await visit(child, [...path, model]));
         // One logical combo output: conservative ceilings, never a sum of seat outputs.
-        return {
+        const result = {
           contextWindow: Math.min(...limits.map((limit) => limit.contextWindow)),
           maxOutput: Math.min(...limits.map((limit) => limit.maxOutput)),
+          depth: Math.max(...limits.map((limit) => limit.depth)) + 1,
         };
+        modelLimits.set(model, result);
+        return result;
       };
       return visit(target);
     },

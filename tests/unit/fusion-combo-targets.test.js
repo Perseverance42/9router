@@ -24,7 +24,8 @@ vi.mock("open-sse/handlers/chatCore.js", () => ({ handleChatCore: mocks.core }))
 vi.mock("open-sse/handlers/systemoneCore.js", () => ({ handleSystemoneCore: mocks.systemone }));
 
 const { handleChat } = await import("../../src/sse/handlers/chat.js");
-const { resetComboRotation } = await import("../../open-sse/services/combo.js");
+const comboService = await import("../../open-sse/services/combo.js");
+const { resetComboRotation } = comboService;
 const { deliverFusionCompletion } = await import("../../open-sse/services/fusionOutput.js");
 const { resolveSmartChoice } = await import("../../src/sse/services/systemoneRouter.js");
 const completion = (message) => Response.json({
@@ -276,6 +277,46 @@ it("checks shared DAG subtrees once per request", async () => {
   expect((await chat()).status).toBe(200);
   expect(mocks.lookup.mock.calls.length).toBeGreaterThan(24);
   expect(mocks.lookup.mock.calls.length).toBeLessThan(110);
+});
+
+it("bounds descendant lookups for a reconvergent logical judge combo on each request", async () => {
+  add("Main", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "Judge", fusionTuning: { minPanels: 0, maxPanels: 0 } });
+  add("Judge", ["Level0a", "Level0b"]);
+  for (let i = 0; i < 24; i++) {
+    const children = i === 23 ? ["openai/judge"] : [`Level${i + 1}a`, `Level${i + 1}b`];
+    add(`Level${i}a`, children);
+    add(`Level${i}b`, children);
+  }
+  for (let request = 0; request < 2; request++) {
+    mocks.lookup.mockClear();
+    expect((await chat()).status).toBe(200);
+    expect(mocks.lookup.mock.calls.length).toBeGreaterThan(49);
+    expect(mocks.lookup.mock.calls.length).toBeLessThan(400);
+  }
+});
+
+it.each([29, 30])("rechecks cached model-limit subtree depth on a deep incoming judge path (%i)", async (length) => {
+  add("Main", ["openai/panel"], { fallbackStrategy: "fusion", judgeModel: "Judge" });
+  add("Judge", ["Shared", "Level0"]);
+  add("Shared", ["Tail"]);
+  add("Tail", ["openai/judge"]);
+  for (let i = 0; i < length; i++) add(`Level${i}`, [i === length - 1 ? "Shared" : `Level${i + 1}`]);
+  // Exercise limit resolution directly; public graph preflight independently rejects deep paths.
+  const spy = vi.spyOn(comboService, "handleFusionChat").mockImplementationOnce(async ({ getModelLimits }) => {
+    try {
+      await getModelLimits("Judge");
+      return new Response(null, { status: 200 });
+    } catch {
+      return new Response(null, { status: 400 });
+    }
+  });
+  try {
+    expect((await chat()).status).toBe(length === 29 ? 200 : 400);
+    expect(mocks.lookup.mock.calls.length).toBeLessThan(150);
+    expect(mocks.core).not.toHaveBeenCalled();
+  } finally {
+    spy.mockRestore();
+  }
 });
 
 it.each([29, 30])("checks cached subtree depth on a shallow-first DAG with %i intervening combos", async (length) => {

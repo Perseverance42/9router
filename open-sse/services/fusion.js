@@ -170,7 +170,8 @@ function anonymize(responses) {
   return shuffled.map((response, i) => ({ id: `response_${i + 1}`, ...response }));
 }
 
-// Text-only estimate, not a tokenizer. Media payloads have provider-specific costs.
+// Text-only estimate, not a tokenizer. Exclude media payloads, but preserve them
+// for dispatch; provider-specific media costs can still overflow upstream.
 export function estimateFusionRequest(request) {
   let mediaEstimationUnsupported = false;
   const text = JSON.stringify(request, function (key, value) {
