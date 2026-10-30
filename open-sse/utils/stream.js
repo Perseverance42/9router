@@ -138,8 +138,10 @@ export function createSSEStream(options = {}) {
     const terminal = output.split("\n").some((line) => {
       if (!line.startsWith("data:")) return false;
       const parsed = parseSSELine(line);
+      // Native incomplete/failed events retain failure semantics; only success
+      // terminals synthesized by translators need completion authorization.
       return parsed?.type === "message_stop" ||
-        ["response.completed", "response.done", "response.incomplete"].includes(parsed?.type);
+        ["response.completed", "response.done"].includes(parsed?.type);
     });
     if (terminal) { pendingTerminals.push(output); return; }
     reqLogger?.appendConvertedChunk?.(output);
@@ -419,7 +421,8 @@ export function createSSEStream(options = {}) {
           ? getOpenAIResponsesEventName(currentOpenAIResponsesEvent, parsed)
           : null;
 
-        if (isOpenAIResponsesStream && isOpenAIResponsesTerminalEvent(openAIResponsesEventName, parsed)) {
+        if (isOpenAIResponsesStream && (isOpenAIResponsesTerminalEvent(openAIResponsesEventName, parsed) ||
+            openAIResponsesEventName === "response.incomplete")) {
           openAIResponsesTerminalSeen = true;
         }
 

@@ -205,6 +205,23 @@ describe("wire completion normalization through registered translators and Fusio
     rejected(await run(frame({ type: "response.completed", response: { status: "failed" } }), FORMATS.OPENAI_RESPONSES));
     rejected(await run(frame({ type: "response.failed", response: { status: "failed", error: { message: "failed" } } }), FORMATS.OPENAI_RESPONSES));
   });
+  it("preserves native Responses content_filter incomplete without fabricated success", async () => {
+    const incomplete = { type: "response.incomplete", response: { id: "resp_terminal", status: "incomplete", incomplete_details: { reason: "content_filter" } } };
+    const result = await run(frame(responses()[0]) + frame(incomplete), FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES);
+    expect(result.text).toContain(data(incomplete));
+    expect(result.text).not.toContain("response.completed");
+    expect(result.text).not.toContain("response.failed");
+    expect(result.text).not.toContain(done);
+    // Fusion permits incomplete text; it must still reject truncated tool output.
+    expect(result.abort.signal.aborted).toBe(false);
+    expect(result.validate).toHaveBeenCalledTimes(1);
+    const tool = await run([...responses(true).slice(0, -1), incomplete].map(frame).join(""), FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI_RESPONSES);
+    expect(tool.text).toContain(data(incomplete));
+    expect(tool.text).not.toContain(done);
+    expect(tool.validate).not.toHaveBeenCalled();
+    expect(tool.abort.signal.aborted).toBe(true);
+    expect(tool.output).toContain('"error"');
+  });
   it("does not bless incomplete Responses with synthetic stop", async () => {
     rejected(await run([...responses().slice(0, -1), { type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" } } }].map(frame).join(""), FORMATS.OPENAI_RESPONSES));
   });
