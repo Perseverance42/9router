@@ -208,6 +208,9 @@ describe("wire completion normalization through registered translators and Fusio
         expect(result.text).toContain(terminal);
         expect(result.output).toContain(terminal);
         rejected(await run(fixture(tool).slice(0, -1).map(frame).join(""), format, format, "production"));
+        const foreignSentinel = await run(fixture(tool).slice(0, -1).map(frame).join("") + done, format, format, "production");
+        rejected(foreignSentinel);
+        expect(foreignSentinel.text).not.toContain(frame(fixture(tool).at(-1)));
       });
     }
   }
